@@ -11,6 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from chat_graph import (
+    close_chat_persistence,
+    get_checkpoint_database_url,
+    initialize_chat_persistence,
+)
 from chat_service import ChatService
 from model_factory import PROVIDER_CONFIGS, ProviderName, get_provider_credentials
 
@@ -40,8 +45,14 @@ class RateLimitError(Exception):
 async def lifespan(_: FastAPI):
     for provider in PROVIDER_CONFIGS:
         get_provider_credentials(provider)
+    get_checkpoint_database_url()
+    await initialize_chat_persistence()
     logger.info("All provider credentials verified")
-    yield
+    logger.info("Postgres chat persistence initialized")
+    try:
+        yield
+    finally:
+        await close_chat_persistence()
 
 
 class HealthResponse(BaseModel):
@@ -159,9 +170,10 @@ def healthz() -> HealthResponse:
 
 
 @app.get("/readyz", response_model=HealthResponse)
-def readyz() -> HealthResponse:
+async def readyz() -> HealthResponse:
     for provider in PROVIDER_CONFIGS:
         get_provider_credentials(provider)
+    get_checkpoint_database_url()
     return HealthResponse()
 
 
