@@ -7,6 +7,7 @@ from langchain_openai import ChatOpenAI
 
 
 ProviderName = Literal["glm", "openrouter", "gemini"]
+DEFAULT_PROVIDER: ProviderName = "gemini"
 
 
 @dataclass(frozen=True)
@@ -36,7 +37,7 @@ PROVIDER_CONFIGS: dict[ProviderName, ProviderConfig] = {
 
 
 def get_chat_model(
-    provider: ProviderName = "openrouter",
+    provider: ProviderName = DEFAULT_PROVIDER,
     model_name: str | None = None,
     dotenv_path: str = ".env",
     **kwargs,
@@ -52,7 +53,7 @@ def get_chat_model(
 
 
 def get_provider_credentials(
-    provider: ProviderName = "openrouter",
+    provider: ProviderName = DEFAULT_PROVIDER,
     dotenv_path: str = ".env",
 ) -> tuple[ProviderConfig, str]:
     load_dotenv(dotenv_path=dotenv_path)
@@ -64,40 +65,3 @@ def get_provider_credentials(
     return config, api_key
 
 
-def get_glm_model(
-    model_name: str = "glm-4.5",
-    dotenv_path: str = ".env",
-    **kwargs,
-) -> ChatOpenAI:
-    return get_chat_model(
-        provider="glm",
-        model_name=model_name,
-        dotenv_path=dotenv_path,
-        **kwargs,
-    )
-
-
-def get_openrouter_model(
-    model_name: str = "openrouter/free",
-    dotenv_path: str = ".env",
-    **kwargs,
-) -> ChatOpenAI:
-    return get_chat_model(
-        provider="openrouter",
-        model_name=model_name,
-        dotenv_path=dotenv_path,
-        **kwargs,
-    )
-
-
-def get_gemini_model(
-    model_name: str = "gemini-flash-latest",
-    dotenv_path: str = ".env",
-    **kwargs,
-) -> ChatOpenAI:
-    return get_chat_model(
-        provider="gemini",
-        model_name=model_name,
-        dotenv_path=dotenv_path,
-        **kwargs,
-    )
