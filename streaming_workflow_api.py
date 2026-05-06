@@ -27,6 +27,7 @@ class GraphState(TypedDict):
 
 class WorkflowRequest(BaseModel):
     query: str = Field(min_length=1, max_length=500)
+    workspace: str = Field(default="general", max_length=50)
 
 
 class WorkflowResponse(BaseModel):
@@ -222,6 +223,7 @@ router = APIRouter()
 
 class SchemaRequest(BaseModel):
     query: str = Field(min_length=1, max_length=500)
+    workspace: str = Field(default="logistics-schema", max_length=50)
 
 
 @router.post("/v1/workflow", response_model=WorkflowResponse)
@@ -304,22 +306,27 @@ async def stream_workflow(request: Request, payload: WorkflowRequest) -> Streami
     )
 
 
-async def _run_schema_workflow(query: str) -> GraphState:
-    sql = None
+def _get_workspace_schema(workspace: str) -> str:
+    schemas = {
+        "logistics-schema": "- shipments(shipment_id, origin_hub_id, destination_hub_id, status, created_at)\n- hubs(hub_id, hub_code, city)",
+        "general": "",
+    }
+    return schemas.get(workspace, "")
+
+
+async def _run_schema_workflow(query: str, workspace: str) -> GraphState:
+    tables = _get_workspace_schema(workspace)
+    schema_section = f"\nTables:\n{tables}\n" if tables else "\n(No database schema available for this workspace.)\n"
+
     prompt = ChatPromptTemplate.from_template(
         """
-Generate a safe SQL query for PostgreSQL.
-
-Tables:
-- shipments(shipment_id, origin_hub_id, destination_hub_id, status, created_at)
-- hubs(hub_id, hub_code, city)
-
+Generate a safe SQL query for PostgreSQL.{schema_section}
 Query: {query}
 
 Return only SQL.
 """
     )
-    response = get_llm().invoke(prompt.invoke({"query": query}))
+    response = get_llm().invoke(prompt.invoke({"query": query, "schema_section": schema_section}))
     sql = response.content.strip()
     logger.info("Generated SQL: %s", sql)
 
@@ -363,7 +370,7 @@ async def stream_schema_workflow(_request: Request, payload: SchemaRequest) -> S
             yield sse("start", {"query": payload.query})
             yield sse("node", {"node": "sql_generator", "data": "Generating SQL..."})
 
-            result = await _run_schema_workflow(payload.query)
+            result = await _run_schema_workflow(payload.query, payload.workspace)
 
             yield sse("node", {"node": "query_tool", "data": {"result": result.get("result", "")}})
             yield sse("complete", {"result": result.get("result")})
