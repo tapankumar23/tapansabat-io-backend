@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from functools import lru_cache
 from typing import TypedDict
 
@@ -7,6 +8,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, StateGraph
+from psycopg import AsyncConnection
+from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 
 from chat_service import _normalize_stream_part, _stringify_message_content as _stringify_content
@@ -80,11 +83,65 @@ Return only SQL.
     return {**state, "parsed": {"sql": response.content.strip()}}
 
 
-def query_tool(state: GraphState) -> GraphState:
+def query_tool(_state: GraphState) -> GraphState:
+    raise RuntimeError("query_tool must be called with astream_node, not ainvoke")
+
+
+async def _get_db_url() -> str:
+    for env_var in ("LANGGRAPH_POSTGRES_URL", "DATABASE_URL", "SUPABASE_DB_URL"):
+        value = (os.getenv(env_var) or "").strip()
+        if value:
+            return value
+    raise RuntimeError("No database URL found in environment variables.")
+
+
+_READONLY_KEYWORDS = frozenset({"select", "with"})
+_SQLITE_TRAGIC_PATTERNS = re.compile(
+    r"\b(drop\s+table|drop\s+database|truncate|delete\s+from\s+\w+\s*;?\s*--|alter\s+table|insert\s+into|update\s+\w+\s+set|create\s+index|grant\s+on|revoke\s+on)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_safe_sql(sql: str) -> bool:
+    cleaned = sql.strip().rstrip(";")
+    if not cleaned:
+        return False
+    first_word = cleaned.split()[0].lower()
+    if first_word not in _READONLY_KEYWORDS:
+        return False
+    if _SQLITE_TRAGIC_PATTERNS.search(cleaned):
+        return False
+    return True
+
+
+async def _execute_sql(sql: str) -> list[dict]:
+    conn = await AsyncConnection.connect(
+        await _get_db_url(),
+        autocommit=True,
+        prepare_threshold=None,
+        row_factory=dict_row,
+    )
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute(sql)
+            rows = await cur.fetchall()
+            return [dict(row) for row in rows]
+    finally:
+        await conn.close()
+
+
+async def query_tool_async(state: GraphState) -> GraphState:
     sql = state["parsed"]["sql"]
     logger.info("Executing SQL: %s", sql)
-    result = [{"hub": "BLR", "count": 120}]
-    return {**state, "result": str(result)}
+    if not _is_safe_sql(sql):
+        logger.warning("Blocked unsafe SQL: %s", sql)
+        return {**state, "result": "SQL query blocked: only SELECT queries are allowed."}
+    try:
+        rows = await _execute_sql(sql)
+        return {**state, "result": str(rows)}
+    except Exception as exc:
+        logger.exception("SQL execution failed: %s", sql)
+        return {**state, "result": f"SQL execution error: {exc}"}
 
 
 def formatter(state: GraphState) -> GraphState:
@@ -189,7 +246,7 @@ def build_graph():
     builder.add_node("classifier", classify)
     builder.add_node("metric_resolver", metric_resolver)
     builder.add_node("sql_generator", sql_generator)
-    builder.add_node("query_tool", query_tool)
+    builder.add_node("query_tool", query_tool_async)
     builder.add_node("formatter", formatter)
     builder.add_node("intent_parser", intent_parser)
     builder.add_node("validate", validate)
