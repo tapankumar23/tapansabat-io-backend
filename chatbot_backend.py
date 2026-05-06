@@ -67,6 +67,18 @@ class ChatResponse(BaseModel):
     model_name: str | None = None
 
 
+class ModelInfo(BaseModel):
+    provider: ProviderName
+    model: str
+    api_key_set: bool
+
+
+class ModelsResponse(BaseModel):
+    default_provider: ProviderName
+    default_model: str
+    providers: dict[ProviderName, ModelInfo]
+
+
 service = ChatService()
 app = FastAPI(title="AI Chatbot Backend", version="1.0.0", lifespan=lifespan)
 
@@ -109,6 +121,23 @@ def readyz() -> HealthResponse:
     for provider in PROVIDER_CONFIGS:
         get_provider_credentials(provider)
     return HealthResponse()
+
+
+@app.get("/v1/models", response_model=ModelsResponse)
+def list_models() -> ModelsResponse:
+    providers = {}
+    for name, config in PROVIDER_CONFIGS.items():
+        api_key = os.getenv(config.env_var, "").strip()
+        providers[name] = ModelInfo(
+            provider=name,
+            model=config.default_model,
+            api_key_set=bool(api_key),
+        )
+    return ModelsResponse(
+        default_provider=DEFAULT_PROVIDER,
+        default_model=PROVIDER_CONFIGS[DEFAULT_PROVIDER].default_model,
+        providers=providers,
+    )
 
 
 @app.post(
