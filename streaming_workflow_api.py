@@ -1,35 +1,25 @@
-import json
 import logging
 import os
 from functools import lru_cache
-from typing import Optional, TypedDict
+from typing import TypedDict
 
-from dotenv import load_dotenv
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
-load_dotenv()
+from chat_service import _normalize_stream_part, _stringify_message_content as _stringify_content
+from model_factory import DEFAULT_PROVIDER, get_chat_model
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 
 class GraphState(TypedDict):
     user_query: str
-    intent: Optional[str]
-    parsed: Optional[dict]
-    result: Optional[str]
-
-
-class ErrorResponse(BaseModel):
-    detail: str
+    intent: str | None
+    parsed: dict | None
+    result: str | None
 
 
 class WorkflowRequest(BaseModel):
@@ -42,19 +32,10 @@ class WorkflowResponse(BaseModel):
 
 
 @lru_cache(maxsize=1)
-def get_llm() -> ChatOpenAI:
-    model_name = os.getenv("STREAMING_WORKFLOW_MODEL", "gpt-4o-mini")
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    base_url = (os.getenv("STREAMING_WORKFLOW_BASE_URL") or "").strip()
-
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY is required for `streaming_workflow_api.py`.")
-
-    kwargs: dict[str, object] = {"model": model_name, "temperature": 0}
-    if base_url:
-        kwargs["base_url"] = base_url
-
-    return ChatOpenAI(api_key=api_key, **kwargs)
+def get_llm():
+    provider = os.getenv("STREAMING_WORKFLOW_PROVIDER", DEFAULT_PROVIDER)
+    model_name = os.getenv("STREAMING_WORKFLOW_MODEL") or None
+    return get_chat_model(provider=provider, model_name=model_name, temperature=0)
 
 
 def classify(state: GraphState) -> GraphState:
@@ -101,11 +82,9 @@ Return only SQL.
 
 def query_tool(state: GraphState) -> GraphState:
     sql = state["parsed"]["sql"]
-
     logger.info("Executing SQL: %s", sql)
-
     result = [{"hub": "BLR", "count": 120}]
-    return {**state, "result": json.dumps(result)}
+    return {**state, "result": str(result)}
 
 
 def formatter(state: GraphState) -> GraphState:
@@ -166,7 +145,7 @@ def update_lcr_route_api(payload: dict) -> dict:
 def tool_caller(state: GraphState) -> GraphState:
     payload = state["parsed"] or {}
     response = update_lcr_route_api(payload)
-    return {**state, "result": json.dumps(response)}
+    return {**state, "result": str(response)}
 
 
 def action_formatter(state: GraphState) -> GraphState:
@@ -184,12 +163,24 @@ def chat_node(state: GraphState) -> GraphState:
     return {**state, "result": _stringify_content(response.content)}
 
 
-def router(state: GraphState) -> str:
+def _route(state: GraphState) -> str:
     if state["intent"] == "analytics":
         return "analytics"
     if state["intent"] == "action":
         return "action"
     return "chat"
+
+
+def _parse_json_object(raw_text: str) -> dict:
+    candidate = raw_text.strip()
+    if candidate.startswith("```"):
+        lines = [line for line in candidate.splitlines() if not line.startswith("```")]
+        candidate = "\n".join(lines).strip()
+    import json
+    parsed = json.loads(candidate)
+    if not isinstance(parsed, dict):
+        raise ValueError("Expected a JSON object from the intent parser.")
+    return parsed
 
 
 def build_graph():
@@ -209,7 +200,7 @@ def build_graph():
     builder.set_entry_point("classifier")
     builder.add_conditional_edges(
         "classifier",
-        router,
+        _route,
         {
             "analytics": "metric_resolver",
             "action": "intent_parser",
@@ -235,13 +226,9 @@ graph = build_graph()
 router = APIRouter()
 
 
-@router.post(
-    "/v1/workflow",
-    response_model=WorkflowResponse,
-    responses={400: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
-)
-def invoke_workflow(payload: WorkflowRequest) -> WorkflowResponse:
-    result = graph.invoke(
+@router.post("/v1/workflow", response_model=WorkflowResponse)
+async def invoke_workflow(payload: WorkflowRequest) -> WorkflowResponse:
+    result = await graph.ainvoke(
         {
             "user_query": payload.query,
             "intent": None,
@@ -252,19 +239,17 @@ def invoke_workflow(payload: WorkflowRequest) -> WorkflowResponse:
     return WorkflowResponse(intent=result.get("intent"), result=result["result"])
 
 
-@router.post(
-    "/v1/workflow/stream",
-    response_model=None,
-    responses={400: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
-)
-async def stream_workflow(
-    request: Request,
-    payload: WorkflowRequest,
-) -> StreamingResponse:
+@router.post("/v1/workflow/stream", response_model=None)
+async def stream_workflow(request: Request, payload: WorkflowRequest) -> StreamingResponse:
+    import json
+
+    def sse(event: str, data: dict) -> str:
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
     async def event_stream():
         try:
-            final_state: dict[str, object] | None = None
-            yield _sse_event("start", {"query": payload.query})
+            final_state: dict | None = None
+            yield sse("start", {"query": payload.query})
 
             async for part in graph.astream(
                 {
@@ -279,32 +264,26 @@ async def stream_workflow(
                 if await request.is_disconnected():
                     return
 
-                normalized_part = _normalize_stream_part(part)
-                if normalized_part is None:
+                normalized = _normalize_stream_part(part)
+                if normalized is None:
                     continue
 
-                if normalized_part["type"] == "updates":
-                    update_data = normalized_part["data"]
+                if normalized["type"] == "updates":
+                    update_data = normalized["data"]
                     if isinstance(update_data, dict):
                         for node_name, node_update in update_data.items():
-                            yield _sse_event(
-                                "node",
-                                {
-                                    "node": node_name,
-                                    "data": node_update,
-                                },
-                            )
+                            yield sse("node", {"node": node_name, "data": node_update})
                     continue
 
-                if normalized_part["type"] == "values":
-                    state = normalized_part["data"]
+                if normalized["type"] == "values":
+                    state = normalized["data"]
                     if isinstance(state, dict):
                         final_state = state
 
             if final_state is None:
                 raise ValueError("Workflow completed without a final state.")
 
-            yield _sse_event(
+            yield sse(
                 "complete",
                 {
                     "intent": final_state.get("intent"),
@@ -313,10 +292,10 @@ async def stream_workflow(
                 },
             )
         except ValueError as exc:
-            yield _sse_event("error", {"detail": str(exc)})
-        except Exception as exc:
-            logger.exception("Unhandled streaming workflow error", exc_info=exc)
-            yield _sse_event("error", {"detail": "workflow request failed"})
+            yield sse("error", {"detail": str(exc)})
+        except Exception:
+            logger.exception("Unhandled streaming workflow error")
+            yield sse("error", {"detail": "workflow request failed"})
 
     return StreamingResponse(
         event_stream(),
@@ -330,43 +309,3 @@ async def stream_workflow(
 
 
 __all__ = ["router"]
-
-
-def _normalize_stream_part(part: object) -> dict[str, object] | None:
-    if isinstance(part, dict):
-        return part
-    if isinstance(part, tuple) and len(part) == 2 and isinstance(part[0], str):
-        return {"type": part[0], "data": part[1]}
-    return None
-
-
-def _parse_json_object(raw_text: str) -> dict:
-    candidate = raw_text.strip()
-    if candidate.startswith("```"):
-        lines = [line for line in candidate.splitlines() if not line.startswith("```")]
-        candidate = "\n".join(lines).strip()
-    parsed = json.loads(candidate)
-    if not isinstance(parsed, dict):
-        raise ValueError("Expected a JSON object from the intent parser.")
-    return parsed
-
-
-def _stringify_content(content: object) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict) and item.get("type") == "text":
-                text = item.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        if parts:
-            return "\n".join(parts)
-    return str(content)
-
-
-def _sse_event(event: str, data: dict[str, object]) -> str:
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"

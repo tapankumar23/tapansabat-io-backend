@@ -7,18 +7,17 @@ from uuid import uuid4
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 load_dotenv()
 
 from chat_graph import clear_cache as clear_graph_cache  # noqa: E402
 from chat_persistence import close as close_persistence  # noqa: E402
-from chat_persistence import get_database_url  # noqa: E402
 from chat_persistence import initialize as initialize_persistence  # noqa: E402
 from chat_service import ChatService  # noqa: E402
 from model_factory import DEFAULT_PROVIDER, PROVIDER_CONFIGS, ProviderName, get_provider_credentials  # noqa: E402
-from rate_limit import RateLimitError, enforce as enforce_rate_limit  # noqa: E402
+from rate_limit import enforce as enforce_rate_limit  # noqa: E402
 from streaming_workflow_api import router as workflow_router  # noqa: E402
 
 logging.basicConfig(
@@ -34,7 +33,6 @@ MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "100"))
 async def lifespan(_: FastAPI):
     for provider in PROVIDER_CONFIGS:
         get_provider_credentials(provider)
-    get_database_url()
     await initialize_persistence()
     logger.info("All provider credentials verified")
     logger.info("Postgres chat persistence initialized")
@@ -100,32 +98,6 @@ def _sse_event(event: str, data: dict[str, object]) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-@app.exception_handler(RateLimitError)
-async def handle_rate_limit(request: Request, exc: RateLimitError) -> JSONResponse:
-    return JSONResponse(
-        status_code=429,
-        headers={"Retry-After": str(exc.retry_after)},
-        content=ErrorResponse(detail=str(exc), request_id=_request_id(request)).model_dump(),
-    )
-
-
-@app.exception_handler(ValueError)
-async def handle_value_error(request: Request, exc: ValueError) -> JSONResponse:
-    return JSONResponse(
-        status_code=400,
-        content=ErrorResponse(detail=str(exc), request_id=_request_id(request)).model_dump(),
-    )
-
-
-@app.exception_handler(Exception)
-async def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
-    logger.exception("Unhandled chatbot backend error", exc_info=exc)
-    return JSONResponse(
-        status_code=502,
-        content=ErrorResponse(detail="chat request failed", request_id=_request_id(request)).model_dump(),
-    )
-
-
 @app.get("/", response_model=HealthResponse)
 @app.get("/healthz", response_model=HealthResponse)
 def healthz() -> HealthResponse:
@@ -136,7 +108,6 @@ def healthz() -> HealthResponse:
 def readyz() -> HealthResponse:
     for provider in PROVIDER_CONFIGS:
         get_provider_credentials(provider)
-    get_database_url()
     return HealthResponse()
 
 
@@ -209,8 +180,8 @@ async def chat_stream(
                 "error",
                 {"detail": str(exc), "request_id": _request_id(request)},
             )
-        except Exception as exc:
-            logger.exception("Unhandled chatbot stream error", exc_info=exc)
+        except Exception:
+            logger.exception("Unhandled chatbot stream error")
             yield _sse_event(
                 "error",
                 {"detail": "chat request failed", "request_id": _request_id(request)},

@@ -1,6 +1,5 @@
 import asyncio
 import os
-import threading
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
@@ -9,7 +8,6 @@ _DB_URL_ENV_VARS = ("LANGGRAPH_POSTGRES_URL", "DATABASE_URL", "SUPABASE_DB_URL")
 _checkpointer_cm = None
 _checkpointer: AsyncPostgresSaver | None = None
 _lock: asyncio.Lock | None = None
-_lock_guard = threading.Lock()
 
 
 def get_database_url() -> str:
@@ -34,10 +32,9 @@ def _auto_setup_enabled() -> bool:
 
 def _get_lock() -> asyncio.Lock:
     global _lock
-    with _lock_guard:
-        if _lock is None:
-            _lock = asyncio.Lock()
-        return _lock
+    if _lock is None:
+        _lock = asyncio.Lock()
+    return _lock
 
 
 async def initialize() -> None:

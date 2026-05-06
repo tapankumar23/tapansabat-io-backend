@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import Annotated, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import AnyMessage
 from langgraph.graph import END, START, StateGraph
@@ -13,10 +13,11 @@ class ChatState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
 
 
-def _build_chat_app(
+@lru_cache(maxsize=16)
+def _compiled_chat_app(
     provider: ProviderName = DEFAULT_PROVIDER,
     model_name: str | None = None,
-):
+) -> Any:
     llm = get_chat_model(provider=provider, model_name=model_name)
 
     async def chatbot(state: ChatState) -> ChatState:
@@ -31,14 +32,6 @@ def _build_chat_app(
     return graph.compile(checkpointer=get_checkpointer())
 
 
-@lru_cache(maxsize=16)
-def _compiled_chat_app(
-    provider: ProviderName = DEFAULT_PROVIDER,
-    model_name: str | None = None,
-):
-    return _build_chat_app(provider=provider, model_name=model_name)
-
-
 def clear_cache() -> None:
     _compiled_chat_app.cache_clear()
 
@@ -46,8 +39,6 @@ def clear_cache() -> None:
 async def get_chat_app_async(
     provider: ProviderName = DEFAULT_PROVIDER,
     model_name: str | None = None,
-):
+) -> Any:
     await initialize()
     return _compiled_chat_app(provider=provider, model_name=model_name)
-
-

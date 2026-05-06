@@ -1,4 +1,3 @@
-import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
@@ -39,27 +38,6 @@ class ChatStreamEvent:
 class ChatService:
     def __init__(self, app_factory: ChatAppFactory = get_chat_app_async) -> None:
         self._app_factory = app_factory
-
-    def chat(
-        self,
-        *,
-        message: str,
-        session_id: str | None = None,
-        provider: ProviderName = DEFAULT_PROVIDER,
-        model_name: str | None = None,
-    ) -> ChatResult:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(
-                self.achat(
-                    message=message,
-                    session_id=session_id,
-                    provider=provider,
-                    model_name=model_name,
-                )
-            )
-        raise RuntimeError("Use `await ChatService.achat(...)` when running inside an event loop.")
 
     async def achat(
         self,

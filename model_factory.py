@@ -39,10 +39,9 @@ PROVIDER_CONFIGS: dict[ProviderName, ProviderConfig] = {
 def get_chat_model(
     provider: ProviderName = DEFAULT_PROVIDER,
     model_name: str | None = None,
-    dotenv_path: str = ".env",
     **kwargs,
 ) -> ChatOpenAI:
-    config, api_key = get_provider_credentials(provider=provider, dotenv_path=dotenv_path)
+    config, api_key = get_provider_credentials(provider=provider)
 
     return ChatOpenAI(
         model=model_name or config.default_model,
@@ -54,9 +53,8 @@ def get_chat_model(
 
 def get_provider_credentials(
     provider: ProviderName = DEFAULT_PROVIDER,
-    dotenv_path: str = ".env",
 ) -> tuple[ProviderConfig, str]:
-    load_dotenv(dotenv_path=dotenv_path)
+    load_dotenv()
 
     config = PROVIDER_CONFIGS[provider]
     api_key = os.getenv(config.env_var)
