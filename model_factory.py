@@ -6,8 +6,10 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
 
+load_dotenv()
+
 ProviderName = Literal["glm", "openrouter", "gemini"]
-DEFAULT_PROVIDER: ProviderName = "gemini"
+DEFAULT_PROVIDER: ProviderName = os.getenv("DEFAULT_PROVIDER", "gemini").strip()
 
 
 @dataclass(frozen=True)

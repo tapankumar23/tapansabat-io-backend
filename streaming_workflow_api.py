@@ -104,7 +104,10 @@ _SQLITE_TRAGIC_PATTERNS = re.compile(
 
 
 def _is_safe_sql(sql: str) -> bool:
-    cleaned = sql.strip().rstrip(";")
+    cleaned = _strip_sql_fences(sql)
+    if not cleaned:
+        return False
+    cleaned = cleaned.rstrip(";")
     if not cleaned:
         return False
     first_word = cleaned.split()[0].lower()
@@ -113,6 +116,14 @@ def _is_safe_sql(sql: str) -> bool:
     if _SQLITE_TRAGIC_PATTERNS.search(cleaned):
         return False
     return True
+
+
+def _strip_sql_fences(raw: str) -> str:
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        cleaned = "\n".join(line for line in lines if not line.startswith("```")).strip()
+    return cleaned
 
 
 async def _execute_sql(sql: str) -> list[dict]:
@@ -310,13 +321,14 @@ Return only SQL.
     )
     response = get_llm().invoke(prompt.invoke({"query": query}))
     sql = response.content.strip()
+    logger.info("Generated SQL: %s", sql)
 
     if not _is_safe_sql(sql):
         logger.warning("Blocked unsafe SQL: %s", sql)
         return {"user_query": query, "intent": "analytics", "parsed": None, "result": "SQL query blocked: only SELECT queries are allowed."}
 
     try:
-        rows = await _execute_sql(sql)
+        rows = await _execute_sql(_strip_sql_fences(sql))
         result = str(rows)
     except Exception as exc:
         logger.exception("SQL execution failed: %s", sql)
