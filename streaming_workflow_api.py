@@ -30,7 +30,6 @@ class WorkflowRequest(BaseModel):
 
 
 class WorkflowResponse(BaseModel):
-    intent: str | None = None
     result: str
 
 
@@ -46,8 +45,10 @@ def classify(state: GraphState) -> GraphState:
         """
 Classify the user query into one of:
 - analytics
-- action
-- chat
+- general
+
+Analytics: questions about shipments, hubs, counts, metrics, or anything answerable by SQL against the schema.
+General: casual conversation, greetings, or anything not covered by analytics.
 
 Query: {query}
 
@@ -56,8 +57,8 @@ Return only one word.
     )
     response = get_llm().invoke(prompt.invoke({"query": state["user_query"]}))
     intent = response.content.strip().lower()
-    if intent not in {"analytics", "action", "chat"}:
-        intent = "chat"
+    if intent not in {"analytics", "general"}:
+        intent = "general"
     return {**state, "intent": intent}
 
 
@@ -164,57 +165,6 @@ Result: {result}
     return {**state, "result": _stringify_content(response.content)}
 
 
-def intent_parser(state: GraphState) -> GraphState:
-    prompt = ChatPromptTemplate.from_template(
-        """
-Convert this into JSON for route update.
-
-Fields:
-- action
-- source_hub
-- destination_hub
-- current_hub
-- new_next_hub
-- sequence_no
-
-Query: {query}
-
-Return valid JSON only.
-"""
-    )
-    response = get_llm().invoke(prompt.invoke({"query": state["user_query"]}))
-    parsed = _parse_json_object(_stringify_content(response.content))
-    return {**state, "parsed": parsed}
-
-
-def validate(state: GraphState) -> GraphState:
-    payload = state["parsed"] or {}
-    if payload.get("current_hub") == payload.get("new_next_hub"):
-        raise ValueError("Invalid route update")
-    return state
-
-
-def update_lcr_route_api(payload: dict) -> dict:
-    logger.info("Updating route: %s", payload)
-    return {"status": "success"}
-
-
-def tool_caller(state: GraphState) -> GraphState:
-    payload = state["parsed"] or {}
-    response = update_lcr_route_api(payload)
-    return {**state, "result": str(response)}
-
-
-def action_formatter(state: GraphState) -> GraphState:
-    payload = state["parsed"] or {}
-    source_hub = payload.get("source_hub", "unknown")
-    destination_hub = payload.get("destination_hub", "unknown")
-    return {
-        **state,
-        "result": f"Route updated: {source_hub} -> {destination_hub}",
-    }
-
-
 def chat_node(state: GraphState) -> GraphState:
     response = get_llm().invoke(state["user_query"])
     return {**state, "result": _stringify_content(response.content)}
@@ -223,21 +173,7 @@ def chat_node(state: GraphState) -> GraphState:
 def _route(state: GraphState) -> str:
     if state["intent"] == "analytics":
         return "analytics"
-    if state["intent"] == "action":
-        return "action"
-    return "chat"
-
-
-def _parse_json_object(raw_text: str) -> dict:
-    candidate = raw_text.strip()
-    if candidate.startswith("```"):
-        lines = [line for line in candidate.splitlines() if not line.startswith("```")]
-        candidate = "\n".join(lines).strip()
-    import json
-    parsed = json.loads(candidate)
-    if not isinstance(parsed, dict):
-        raise ValueError("Expected a JSON object from the intent parser.")
-    return parsed
+    return "general"
 
 
 def build_graph():
@@ -248,10 +184,6 @@ def build_graph():
     builder.add_node("sql_generator", sql_generator)
     builder.add_node("query_tool", query_tool_async)
     builder.add_node("formatter", formatter)
-    builder.add_node("intent_parser", intent_parser)
-    builder.add_node("validate", validate)
-    builder.add_node("tool_caller", tool_caller)
-    builder.add_node("action_formatter", action_formatter)
     builder.add_node("chat_node", chat_node)
 
     builder.set_entry_point("classifier")
@@ -260,8 +192,7 @@ def build_graph():
         _route,
         {
             "analytics": "metric_resolver",
-            "action": "intent_parser",
-            "chat": "chat_node",
+            "general": "chat_node",
         },
     )
 
@@ -269,11 +200,6 @@ def build_graph():
     builder.add_edge("sql_generator", "query_tool")
     builder.add_edge("query_tool", "formatter")
     builder.add_edge("formatter", END)
-
-    builder.add_edge("intent_parser", "validate")
-    builder.add_edge("validate", "tool_caller")
-    builder.add_edge("tool_caller", "action_formatter")
-    builder.add_edge("action_formatter", END)
 
     builder.add_edge("chat_node", END)
     return builder.compile()
@@ -283,8 +209,12 @@ graph = build_graph()
 router = APIRouter()
 
 
+class SchemaRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=500)
+
+
 @router.post("/v1/workflow", response_model=WorkflowResponse)
-async def invoke_workflow(payload: WorkflowRequest) -> WorkflowResponse:
+async def chat_workflow(payload: WorkflowRequest) -> WorkflowResponse:
     result = await graph.ainvoke(
         {
             "user_query": payload.query,
@@ -293,7 +223,7 @@ async def invoke_workflow(payload: WorkflowRequest) -> WorkflowResponse:
             "result": None,
         }
     )
-    return WorkflowResponse(intent=result.get("intent"), result=result["result"])
+    return WorkflowResponse(result=result["result"])
 
 
 @router.post("/v1/workflow/stream", response_model=None)
@@ -343,8 +273,6 @@ async def stream_workflow(request: Request, payload: WorkflowRequest) -> Streami
             yield sse(
                 "complete",
                 {
-                    "intent": final_state.get("intent"),
-                    "parsed": final_state.get("parsed"),
                     "result": final_state.get("result"),
                 },
             )
@@ -352,6 +280,85 @@ async def stream_workflow(request: Request, payload: WorkflowRequest) -> Streami
             yield sse("error", {"detail": str(exc)})
         except Exception:
             logger.exception("Unhandled streaming workflow error")
+            yield sse("error", {"detail": "workflow request failed"})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _run_schema_workflow(query: str) -> GraphState:
+    sql = None
+    prompt = ChatPromptTemplate.from_template(
+        """
+Generate a safe SQL query for PostgreSQL.
+
+Tables:
+- shipments(shipment_id, origin_hub_id, destination_hub_id, status, created_at)
+- hubs(hub_id, hub_code, city)
+
+Query: {query}
+
+Return only SQL.
+"""
+    )
+    response = get_llm().invoke(prompt.invoke({"query": query}))
+    sql = response.content.strip()
+
+    if not _is_safe_sql(sql):
+        logger.warning("Blocked unsafe SQL: %s", sql)
+        return {"user_query": query, "intent": "analytics", "parsed": None, "result": "SQL query blocked: only SELECT queries are allowed."}
+
+    try:
+        rows = await _execute_sql(sql)
+        result = str(rows)
+    except Exception as exc:
+        logger.exception("SQL execution failed: %s", sql)
+        result = f"SQL execution error: {exc}"
+
+    prompt_fmt = ChatPromptTemplate.from_template(
+        """
+Format this result into a user-friendly answer:
+
+Query: {query}
+Result: {result}
+"""
+    )
+    formatted = get_llm().invoke(prompt_fmt.invoke({"query": query, "result": result}))
+    return {
+        "user_query": query,
+        "intent": "analytics",
+        "parsed": {"sql": sql},
+        "result": _stringify_content(formatted.content),
+    }
+
+
+@router.post("/v1/workflow/schema/stream", response_model=None)
+async def stream_schema_workflow(_request: Request, payload: SchemaRequest) -> StreamingResponse:
+    import json
+
+    def sse(event: str, data: dict) -> str:
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+    async def event_stream():
+        try:
+            yield sse("start", {"query": payload.query})
+            yield sse("node", {"node": "sql_generator", "data": "Generating SQL..."})
+
+            result = await _run_schema_workflow(payload.query)
+
+            yield sse("node", {"node": "query_tool", "data": {"result": result.get("result", "")}})
+            yield sse("complete", {"result": result.get("result")})
+        except ValueError as exc:
+            yield sse("error", {"detail": str(exc)})
+        except Exception:
+            logger.exception("Unhandled schema workflow error")
             yield sse("error", {"detail": "workflow request failed"})
 
     return StreamingResponse(
