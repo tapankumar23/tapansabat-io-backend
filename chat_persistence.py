@@ -1,6 +1,9 @@
 import asyncio
 import os
 
+from psycopg import AsyncConnection
+from psycopg.rows import dict_row
+
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 _DB_URL_ENV_VARS = ("LANGGRAPH_POSTGRES_URL", "DATABASE_URL", "SUPABASE_DB_URL")
@@ -47,29 +50,32 @@ async def initialize() -> None:
         if _checkpointer is not None:
             return
 
-        cm = AsyncPostgresSaver.from_conn_string(get_database_url())
-        checkpointer = None
+        conn = await AsyncConnection.connect(
+            get_database_url(),
+            autocommit=True,
+            prepare_threshold=None,
+            row_factory=dict_row,
+        )
+        checkpointer = AsyncPostgresSaver(conn)
         try:
-            checkpointer = await cm.__aenter__()
             if _auto_setup_enabled():
                 await checkpointer.setup()
         except Exception:
-            if checkpointer is not None:
-                await cm.__aexit__(None, None, None)
+            await conn.close()
             raise
 
-        _checkpointer_cm = cm
         _checkpointer = checkpointer
+        _checkpointer_cm = None
 
 
 async def close() -> None:
     global _checkpointer_cm, _checkpointer
 
     async with _get_lock():
-        if _checkpointer_cm is None:
-            _checkpointer = None
+        if _checkpointer is None:
+            _checkpointer_cm = None
             return
 
-        await _checkpointer_cm.__aexit__(None, None, None)
-        _checkpointer_cm = None
+        await _checkpointer.conn.close()
         _checkpointer = None
+        _checkpointer_cm = None
