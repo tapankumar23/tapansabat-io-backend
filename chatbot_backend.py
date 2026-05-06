@@ -19,6 +19,7 @@ from chat_persistence import initialize as initialize_persistence  # noqa: E402
 from chat_service import ChatService  # noqa: E402
 from model_factory import DEFAULT_PROVIDER, PROVIDER_CONFIGS, ProviderName, get_provider_credentials  # noqa: E402
 from rate_limit import RateLimitError, enforce as enforce_rate_limit  # noqa: E402
+from streaming_workflow_api import router as workflow_router  # noqa: E402
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -79,6 +80,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(workflow_router)
 
 
 @app.middleware("http")

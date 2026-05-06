@@ -5,7 +5,7 @@ from functools import lru_cache
 from typing import Optional, TypedDict
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
@@ -26,11 +26,6 @@ class GraphState(TypedDict):
     intent: Optional[str]
     parsed: Optional[dict]
     result: Optional[str]
-
-
-class HealthResponse(BaseModel):
-    status: str = "ok"
-    service: str = "streaming-workflow-api"
 
 
 class ErrorResponse(BaseModel):
@@ -237,16 +232,10 @@ def build_graph():
 
 
 graph = build_graph()
-app = FastAPI(title="Streaming Workflow API", version="1.0.0")
+router = APIRouter()
 
 
-@app.get("/", response_model=HealthResponse)
-@app.get("/healthz", response_model=HealthResponse)
-def healthz() -> HealthResponse:
-    return HealthResponse()
-
-
-@app.post(
+@router.post(
     "/v1/workflow",
     response_model=WorkflowResponse,
     responses={400: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
@@ -263,7 +252,7 @@ def invoke_workflow(payload: WorkflowRequest) -> WorkflowResponse:
     return WorkflowResponse(intent=result.get("intent"), result=result["result"])
 
 
-@app.post(
+@router.post(
     "/v1/workflow/stream",
     response_model=None,
     responses={400: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
@@ -340,6 +329,9 @@ async def stream_workflow(
     )
 
 
+__all__ = ["router"]
+
+
 def _normalize_stream_part(part: object) -> dict[str, object] | None:
     if isinstance(part, dict):
         return part
@@ -378,18 +370,3 @@ def _stringify_content(content: object) -> str:
 
 def _sse_event(event: str, data: dict[str, object]) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
-
-def main() -> None:
-    import uvicorn
-
-    uvicorn.run(
-        "streaming_workflow_api:app",
-        host=os.getenv("HOST", "0.0.0.0"),
-        port=int(os.getenv("STREAMING_WORKFLOW_PORT", "8002")),
-        reload=False,
-    )
-
-
-if __name__ == "__main__":
-    main()
