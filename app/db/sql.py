@@ -41,7 +41,7 @@ def _apply_row_limit(sql: str) -> str:
     return sql
 
 
-def _get_pool() -> AsyncConnectionPool:
+def get_pool() -> AsyncConnectionPool:
     if _pool is None:
         raise RuntimeError(
             "SQL connection pool is not initialised. "
@@ -72,14 +72,14 @@ async def close_pool() -> None:
 
 
 async def ping_db() -> None:
-    async with _get_pool().connection() as conn:
+    async with get_pool().connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute("SELECT 1")
 
 
 async def execute_sql(sql: str) -> list[dict]:
     capped_sql = _apply_row_limit(sql)
-    async with _get_pool().connection() as conn:
+    async with get_pool().connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(capped_sql)
             rows = await cur.fetchall()
@@ -97,7 +97,7 @@ async def fetch_table_schema(tables: list[str]) -> str:
         return _WORKSPACE_SCHEMA_CACHE[cache_key]
     schema_lines: list[str] = []
     for table in tables:
-        async with _get_pool().connection() as conn:
+        async with get_pool().connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT column_name, data_type FROM information_schema.columns "
@@ -107,7 +107,7 @@ async def fetch_table_schema(tables: list[str]) -> str:
                 )
                 cols = await cur.fetchall()
         if cols:
-            col_defs = ", ".join(f"{r[0]} {r[1]}" for r in cols)
+            col_defs = ", ".join(f"{r['column_name']} {r['data_type']}" for r in cols)
             schema_lines.append(f"{table}: {col_defs}")
     schema = "\n".join(schema_lines)
     _WORKSPACE_SCHEMA_CACHE[cache_key] = schema

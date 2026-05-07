@@ -1,17 +1,12 @@
 from __future__ import annotations
 
-import os
-import uuid
-
+from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
-from app.api.sql import _get_pool
+from app.repositories.sessions import delete_session, get_session, upsert_session
+from app.models.factory import get_default_model, get_default_provider
 
-
-class SessionConfig(BaseModel):
-    session_id: str
-    provider: str = "openrouter"
-    model: str = "openrouter/free"
+router = APIRouter()
 
 
 class SessionUpdate(BaseModel):
@@ -19,66 +14,42 @@ class SessionUpdate(BaseModel):
     model: str | None = Field(default=None, min_length=1, max_length=64)
 
 
-_WORKSPACE_TABLES: dict[str, list[str]] = {}
+class SessionResponse(BaseModel):
+    session_id: str
+    provider: str
+    model: str
 
 
-async def _ensure_sessions_table() -> None:
-    async with _get_pool().connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS chat_sessions (
-                    session_id VARCHAR(128) PRIMARY KEY,
-                    provider   VARCHAR(32)  NOT NULL DEFAULT 'openrouter',
-                    model      VARCHAR(64)  NOT NULL DEFAULT 'openrouter/free',
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-                """
-            )
+@router.get("/v1/sessions/{session_id}", response_model=SessionResponse)
+async def get_session_info(session_id: str) -> SessionResponse:
+    session = await get_session(session_id)
+    if session is None:
+        return SessionResponse(
+            session_id=session_id,
+            provider=get_default_provider().value,
+            model=get_default_model(),
+        )
+    return SessionResponse(
+        session_id=session.session_id,
+        provider=session.provider,
+        model=session.model,
+    )
 
 
-async def get_session(session_id: str) -> SessionConfig | None:
-    await _ensure_sessions_table()
-    async with _get_pool().connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT session_id, provider, model FROM chat_sessions WHERE session_id = %s",
-                (session_id,),
-            )
-            row = await cur.fetchone()
-    if row is None:
-        return None
-    return SessionConfig(session_id=row["session_id"], provider=row["provider"], model=row["model"])
+@router.patch("/v1/sessions/{session_id}", response_model=SessionResponse)
+async def update_session(session_id: str, payload: SessionUpdate) -> SessionResponse:
+    existing = await get_session(session_id)
+    provider = payload.provider or (existing.provider if existing else get_default_provider().value)
+    model = payload.model or (existing.model if existing else get_default_model())
+    session = await upsert_session(session_id, provider, model)
+    return SessionResponse(
+        session_id=session.session_id,
+        provider=session.provider,
+        model=session.model,
+    )
 
 
-async def upsert_session(session_id: str, provider: str, model: str) -> SessionConfig:
-    await _ensure_sessions_table()
-    async with _get_pool().connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                INSERT INTO chat_sessions (session_id, provider, model, updated_at)
-                VALUES (%s, %s, %s, NOW())
-                ON CONFLICT (session_id) DO UPDATE
-                    SET provider = EXCLUDED.provider,
-                        model   = EXCLUDED.model,
-                        updated_at = NOW()
-                RETURNING session_id, provider, model
-                """,
-                (session_id, provider, model),
-            )
-            row = await cur.fetchone()
-    return SessionConfig(session_id=row["session_id"], provider=row["provider"], model=row["model"])
-
-
-async def delete_session(session_id: str) -> bool:
-    await _ensure_sessions_table()
-    async with _get_pool().connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "DELETE FROM chat_sessions WHERE session_id = %s",
-                (session_id,),
-            )
-            deleted = cur.rowcount
-    return (deleted or 0) > 0
+@router.delete("/v1/sessions/{session_id}")
+async def delete_session_endpoint(session_id: str) -> dict:
+    await delete_session(session_id)
+    return {"session_id": session_id, "deleted": True}

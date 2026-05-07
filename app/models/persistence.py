@@ -67,5 +67,5 @@ async def initialize() -> None:
 async def close() -> None:
     global _checkpointer
     if _checkpointer is not None:
-        await _checkpointer.close()
+        await _checkpointer.conn.close()
         _checkpointer = None

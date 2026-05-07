@@ -5,8 +5,8 @@ from typing import TypedDict
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, StateGraph
 
-from app.models.factory import ProviderName, get_default_model, get_default_provider, get_llm
-from app.api.sql import execute_sql, fetch_table_schema, is_safe_sql, strip_sql_fences
+from app.models.factory import ProviderName, get_llm
+from app.db.sql import execute_sql, fetch_table_schema, is_safe_sql, strip_sql_fences
 from app.utils.stream_utils import stringify_message_content
 
 logger = logging.getLogger(__name__)
@@ -28,12 +28,7 @@ _WORKSPACE_TABLES: dict[str, list[str]] = {
 
 
 @lru_cache(maxsize=None)
-def _get_sql_llm(provider: str, model: str):
-    return get_llm(provider=ProviderName(provider), model=model, temperature=0)
-
-
-@lru_cache(maxsize=None)
-def _get_chat_llm(provider: str, model: str):
+def _get_llm(provider: str, model: str):
     return get_llm(provider=ProviderName(provider), model=model, temperature=0)
 
 
@@ -114,13 +109,18 @@ def chat_node(state: GraphState, llm) -> GraphState:
     return {**state, "result": stringify_message_content(response.content)}
 
 
+_INTENT_TO_BRANCH: dict[str, str] = {
+    "analytics": "analytics",
+}
+
+
 def _route(state: GraphState) -> str:
-    return "analytics" if state["intent"] == "analytics" else "general"
+    return _INTENT_TO_BRANCH.get(state["intent"] or "", "general")
 
 
 def build_graph(provider: str, model: str):
-    sql_llm = _get_sql_llm(provider, model)
-    chat_llm = _get_chat_llm(provider, model)
+    sql_llm = _get_llm(provider, model)
+    chat_llm = _get_llm(provider, model)
 
     def classify_with_llm(state: GraphState) -> GraphState:
         return classify(state, sql_llm)
@@ -162,80 +162,3 @@ def _compiled_workflow_graph(provider: str, model: str):
     return build_graph(provider, model)
 
 
-async def run_workflow(
-    query: str,
-    workspace: str,
-    provider: str | None = None,
-    model: str | None = None,
-):
-    resolved_provider = provider or get_default_provider().value
-    resolved_model = model or get_default_model(resolved_provider)
-    graph = _compiled_workflow_graph(resolved_provider, resolved_model)
-    result = await graph.ainvoke({"user_query": query, "workspace": workspace})
-    result["provider"] = resolved_provider
-    result["model"] = resolved_model
-    return result
-
-
-async def run_schema_workflow(
-    query: str,
-    workspace: str,
-    provider: str | None = None,
-    model: str | None = None,
-):
-    resolved_provider = provider or get_default_provider().value
-    resolved_model = model or get_default_model(resolved_provider)
-    sql_llm = _get_sql_llm(resolved_provider, resolved_model)
-
-    tables = _WORKSPACE_TABLES.get(workspace, [])
-    schema_context = await fetch_table_schema(tables)
-    schema_section = f"Tables:\n{schema_context}" if schema_context else "(No database schema available for this workspace.)"
-
-    sql_prompt = ChatPromptTemplate.from_template(
-        """Generate a safe SQL query for PostgreSQL.
-
-{schema_section}
-
-Query: {query}
-
-Return only SQL.
-"""
-    )
-    sql_response = sql_llm.invoke(sql_prompt.invoke({"query": query, "schema_section": schema_section}))
-    raw_sql = sql_response.content.strip()
-    logger.info("Generated SQL: %s", raw_sql)
-
-    if not is_safe_sql(raw_sql):
-        logger.warning("Blocked unsafe SQL: %s", raw_sql)
-        return {
-            "user_query": query, "workspace": workspace, "intent": "analytics",
-            "schema_context": schema_context, "parsed": None,
-            "result": "SQL query blocked: only SELECT queries are allowed.",
-            "provider": resolved_provider, "model": resolved_model,
-        }
-
-    try:
-        rows = await execute_sql(strip_sql_fences(raw_sql))
-        result = str(rows)
-    except Exception as exc:
-        logger.exception("SQL execution failed: %s", raw_sql)
-        result = f"SQL execution error: {exc}"
-
-    fmt_prompt = ChatPromptTemplate.from_template(
-        """Format this result into a user-friendly answer:
-
-Query: {query}
-Result: {result}
-"""
-    )
-    formatted = sql_llm.invoke(fmt_prompt.invoke({"query": query, "result": result}))
-    return {
-        "user_query": query,
-        "workspace": workspace,
-        "intent": "analytics",
-        "schema_context": schema_context,
-        "parsed": {"sql": raw_sql},
-        "result": stringify_message_content(formatted.content),
-        "provider": resolved_provider,
-        "model": resolved_model,
-    }

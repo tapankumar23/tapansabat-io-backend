@@ -6,7 +6,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from app.models.factory import ProviderName, get_default_model, get_default_provider, get_llm
-from app.models.persistence import get_checkpointer, initialize
+from app.models.persistence import get_checkpointer
 
 
 class ChatState(TypedDict):
@@ -34,7 +34,6 @@ def clear_cache() -> None:
 
 
 async def get_chat_app_async(provider: str | None = None, model: str | None = None) -> Any:
-    await initialize()
     resolved_provider = provider or get_default_provider().value
     resolved_model = model or get_default_model(resolved_provider)
     return _compiled_chat_app(resolved_provider, resolved_model)

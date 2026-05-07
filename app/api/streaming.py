@@ -4,11 +4,13 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.utils.stream_utils import normalize_stream_part, sse_event
-from app.graphs.workflow import run_schema_workflow, run_workflow
+from app.service import WorkflowService
+from app.utils.stream_utils import sse_event
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+_workflow_service = WorkflowService()
 
 
 class WorkflowRequest(BaseModel):
@@ -24,8 +26,11 @@ class WorkflowResponse(BaseModel):
     model: str
 
 
-class SchemaRequest(WorkflowRequest):
+class SchemaRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=500)
     workspace: str = Field(default="logistics-schema", max_length=50)
+    provider: str | None = Field(default=None, max_length=32)
+    model: str | None = Field(default=None, max_length=64)
 
 
 _SSE_HEADERS = {
@@ -41,34 +46,31 @@ def _request_id(request: Request) -> str:
 
 @router.post("/v1/workflow", response_model=WorkflowResponse, tags=["Workflow"])
 async def chat_workflow(payload: WorkflowRequest) -> WorkflowResponse:
-    result = await run_workflow(
+    result = await _workflow_service.run(
         query=payload.query,
         workspace=payload.workspace,
         provider=payload.provider,
         model=payload.model,
     )
-    return WorkflowResponse(
-        result=result["result"],
-        provider=result["provider"],
-        model=result["model"],
-    )
+    return WorkflowResponse(result=result.result, provider=result.provider, model=result.model)
 
 
 @router.post("/v1/workflow/stream", response_model=None, tags=["Workflow"])
 async def stream_workflow(request: Request, payload: WorkflowRequest) -> StreamingResponse:
     async def event_stream():
         try:
-            final_state = await run_workflow(
+            async for event in _workflow_service.stream(
                 query=payload.query,
                 workspace=payload.workspace,
                 provider=payload.provider,
                 model=payload.model,
-            )
-            yield sse_event("complete", {
-                "result": final_state.get("result"),
-                "provider": final_state.get("provider"),
-                "model": final_state.get("model"),
-            })
+            ):
+                yield sse_event(event.event, {
+                    "provider": event.provider,
+                    "model": event.model,
+                    **({"result": event.result} if event.result else {}),
+                    **({"detail": event.detail} if event.detail else {}),
+                })
         except ValueError as exc:
             yield sse_event("error", {"detail": str(exc), "request_id": _request_id(request)})
         except Exception:
@@ -82,18 +84,18 @@ async def stream_workflow(request: Request, payload: WorkflowRequest) -> Streami
 async def stream_schema_workflow(request: Request, payload: SchemaRequest) -> StreamingResponse:
     async def event_stream():
         try:
-            yield sse_event("start", {"query": payload.query})
-            final_state = await run_schema_workflow(
+            async for event in _workflow_service.stream(
                 query=payload.query,
                 workspace=payload.workspace,
                 provider=payload.provider,
                 model=payload.model,
-            )
-            yield sse_event("complete", {
-                "result": final_state.get("result"),
-                "provider": final_state.get("provider"),
-                "model": final_state.get("model"),
-            })
+            ):
+                yield sse_event(event.event, {
+                    "provider": event.provider,
+                    "model": event.model,
+                    **({"result": event.result} if event.result else {}),
+                    **({"detail": event.detail} if event.detail else {}),
+                })
         except ValueError as exc:
             yield sse_event("error", {"detail": str(exc), "request_id": _request_id(request)})
         except Exception:
