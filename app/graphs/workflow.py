@@ -1,0 +1,241 @@
+import logging
+from functools import lru_cache
+from typing import TypedDict
+
+from langchain_core.prompts import ChatPromptTemplate
+from langgraph.graph import END, StateGraph
+
+from app.models.factory import ProviderName, get_default_model, get_default_provider, get_llm
+from app.api.sql import execute_sql, fetch_table_schema, is_safe_sql, strip_sql_fences
+from app.utils.stream_utils import stringify_message_content
+
+logger = logging.getLogger(__name__)
+
+
+class GraphState(TypedDict):
+    user_query: str
+    workspace: str
+    intent: str | None
+    schema_context: str | None
+    parsed: dict | None
+    result: str | None
+
+
+_WORKSPACE_TABLES: dict[str, list[str]] = {
+    "logistics-schema": ["shipments", "shipments_events", "lcr", "lcr_routes", "hubs"],
+    "general": [],
+}
+
+
+@lru_cache(maxsize=None)
+def _get_sql_llm(provider: str, model: str):
+    return get_llm(provider=ProviderName(provider), model=model, temperature=0)
+
+
+@lru_cache(maxsize=None)
+def _get_chat_llm(provider: str, model: str):
+    return get_llm(provider=ProviderName(provider), model=model, temperature=0)
+
+
+def classify(state: GraphState, llm) -> GraphState:
+    prompt = ChatPromptTemplate.from_template(
+        """Classify the user query into one of:
+- analytics
+- general
+
+Analytics: questions about shipments, hubs, counts, metrics, or anything answerable by SQL against the schema.
+General: casual conversation, greetings, or anything not covered by analytics.
+
+Query: {query}
+
+Return only one word.
+"""
+    )
+    response = llm.invoke(prompt.invoke({"query": state["user_query"]}))
+    intent = response.content.strip().lower()
+    if intent not in {"analytics", "general"}:
+        intent = "general"
+    return {**state, "intent": intent}
+
+
+async def metric_resolver(state: GraphState) -> GraphState:
+    tables = _WORKSPACE_TABLES.get(state["workspace"], [])
+    schema = await fetch_table_schema(tables)
+    return {**state, "schema_context": schema}
+
+
+def sql_generator(state: GraphState, llm) -> GraphState:
+    schema_context = state.get("schema_context") or ""
+    schema_section = f"Tables:\n{schema_context}" if schema_context else "(No schema available for this workspace.)"
+    prompt = ChatPromptTemplate.from_template(
+        """Generate a safe SQL query for PostgreSQL.
+
+{schema_section}
+
+Query: {query}
+
+Return only SQL.
+"""
+    )
+    response = llm.invoke(prompt.invoke({"query": state["user_query"], "schema_section": schema_section}))
+    return {**state, "parsed": {"sql": response.content.strip()}}
+
+
+async def query_tool_async(state: GraphState) -> GraphState:
+    raw_sql = state["parsed"]["sql"]
+    logger.info("Executing SQL: %s", raw_sql)
+    if not is_safe_sql(raw_sql):
+        logger.warning("Blocked unsafe SQL: %s", raw_sql)
+        return {**state, "result": "SQL query blocked: only SELECT queries are allowed."}
+    try:
+        rows = await execute_sql(strip_sql_fences(raw_sql))
+        return {**state, "result": str(rows)}
+    except Exception as exc:
+        logger.exception("SQL execution failed: %s", raw_sql)
+        return {**state, "result": f"SQL execution error: {exc}"}
+
+
+def formatter(state: GraphState, llm) -> GraphState:
+    prompt = ChatPromptTemplate.from_template(
+        """Format this result into a user-friendly answer:
+
+Query: {query}
+Result: {result}
+"""
+    )
+    response = llm.invoke(
+        prompt.invoke({"query": state["user_query"], "result": state["result"]})
+    )
+    return {**state, "result": stringify_message_content(response.content)}
+
+
+def chat_node(state: GraphState, llm) -> GraphState:
+    response = llm.invoke(state["user_query"])
+    return {**state, "result": stringify_message_content(response.content)}
+
+
+def _route(state: GraphState) -> str:
+    return "analytics" if state["intent"] == "analytics" else "general"
+
+
+def build_graph(provider: str, model: str):
+    sql_llm = _get_sql_llm(provider, model)
+    chat_llm = _get_chat_llm(provider, model)
+
+    def classify_with_llm(state: GraphState) -> GraphState:
+        return classify(state, sql_llm)
+
+    def sql_generator_with_llm(state: GraphState) -> GraphState:
+        return sql_generator(state, sql_llm)
+
+    def formatter_with_llm(state: GraphState) -> GraphState:
+        return formatter(state, sql_llm)
+
+    def chat_node_with_llm(state: GraphState) -> GraphState:
+        return chat_node(state, chat_llm)
+
+    builder = StateGraph(GraphState)
+    builder.add_node("classifier", classify_with_llm)
+    builder.add_node("metric_resolver", metric_resolver)
+    builder.add_node("sql_generator", sql_generator_with_llm)
+    builder.add_node("query_tool", query_tool_async)
+    builder.add_node("formatter", formatter_with_llm)
+    builder.add_node("chat_node", chat_node_with_llm)
+
+    builder.set_entry_point("classifier")
+    builder.add_conditional_edges(
+        "classifier",
+        _route,
+        {"analytics": "metric_resolver", "general": "chat_node"},
+    )
+    builder.add_edge("metric_resolver", "sql_generator")
+    builder.add_edge("sql_generator", "query_tool")
+    builder.add_edge("query_tool", "formatter")
+    builder.add_edge("formatter", END)
+    builder.add_edge("chat_node", END)
+
+    return builder.compile()
+
+
+@lru_cache(maxsize=None)
+def _compiled_workflow_graph(provider: str, model: str):
+    return build_graph(provider, model)
+
+
+async def run_workflow(
+    query: str,
+    workspace: str,
+    provider: str | None = None,
+    model: str | None = None,
+):
+    resolved_provider = provider or get_default_provider().value
+    resolved_model = model or get_default_model(resolved_provider)
+    graph = _compiled_workflow_graph(resolved_provider, resolved_model)
+    result = await graph.ainvoke({"user_query": query, "workspace": workspace})
+    result["provider"] = resolved_provider
+    result["model"] = resolved_model
+    return result
+
+
+async def run_schema_workflow(
+    query: str,
+    workspace: str,
+    provider: str | None = None,
+    model: str | None = None,
+):
+    resolved_provider = provider or get_default_provider().value
+    resolved_model = model or get_default_model(resolved_provider)
+    sql_llm = _get_sql_llm(resolved_provider, resolved_model)
+
+    tables = _WORKSPACE_TABLES.get(workspace, [])
+    schema_context = await fetch_table_schema(tables)
+    schema_section = f"Tables:\n{schema_context}" if schema_context else "(No database schema available for this workspace.)"
+
+    sql_prompt = ChatPromptTemplate.from_template(
+        """Generate a safe SQL query for PostgreSQL.
+
+{schema_section}
+
+Query: {query}
+
+Return only SQL.
+"""
+    )
+    sql_response = sql_llm.invoke(sql_prompt.invoke({"query": query, "schema_section": schema_section}))
+    raw_sql = sql_response.content.strip()
+    logger.info("Generated SQL: %s", raw_sql)
+
+    if not is_safe_sql(raw_sql):
+        logger.warning("Blocked unsafe SQL: %s", raw_sql)
+        return {
+            "user_query": query, "workspace": workspace, "intent": "analytics",
+            "schema_context": schema_context, "parsed": None,
+            "result": "SQL query blocked: only SELECT queries are allowed.",
+            "provider": resolved_provider, "model": resolved_model,
+        }
+
+    try:
+        rows = await execute_sql(strip_sql_fences(raw_sql))
+        result = str(rows)
+    except Exception as exc:
+        logger.exception("SQL execution failed: %s", raw_sql)
+        result = f"SQL execution error: {exc}"
+
+    fmt_prompt = ChatPromptTemplate.from_template(
+        """Format this result into a user-friendly answer:
+
+Query: {query}
+Result: {result}
+"""
+    )
+    formatted = sql_llm.invoke(fmt_prompt.invoke({"query": query, "result": result}))
+    return {
+        "user_query": query,
+        "workspace": workspace,
+        "intent": "analytics",
+        "schema_context": schema_context,
+        "parsed": {"sql": raw_sql},
+        "result": stringify_message_content(formatted.content),
+        "provider": resolved_provider,
+        "model": resolved_model,
+    }

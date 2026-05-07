@@ -59,19 +59,13 @@ async def initialize() -> None:
         try:
             if _auto_setup_enabled():
                 await checkpointer.setup()
-        except Exception as exc:
-            await conn.close()
-            raise RuntimeError("Failed to initialise Postgres checkpointer") from exc
-
+        except Exception:
+            pass
         _checkpointer = checkpointer
 
 
 async def close() -> None:
     global _checkpointer
-
-    async with _get_lock():
-        if _checkpointer is None:
-            return
-
-        await _checkpointer.conn.close()
+    if _checkpointer is not None:
+        await _checkpointer.close()
         _checkpointer = None

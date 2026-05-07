@@ -1,11 +1,10 @@
 import os
 import re
-from collections import defaultdict
 
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
-from chat_persistence import get_database_url
+from app.models.persistence import get_database_url
 
 SQL_MAX_ROWS: int = int(os.getenv("SQL_MAX_ROWS", "500"))
 
@@ -37,7 +36,6 @@ def is_safe_sql(sql: str) -> bool:
 
 
 def _apply_row_limit(sql: str) -> str:
-    """Append LIMIT if absent so the DB never materialises more rows than SQL_MAX_ROWS."""
     if not re.search(r"\bLIMIT\b", sql, re.IGNORECASE):
         return f"{sql.rstrip(';')} LIMIT {SQL_MAX_ROWS}"
     return sql
@@ -74,43 +72,43 @@ async def close_pool() -> None:
 
 
 async def ping_db() -> None:
-    """Lightweight connectivity check — used by /readyz."""
     async with _get_pool().connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute("SELECT 1")
 
 
 async def execute_sql(sql: str) -> list[dict]:
-    """Execute a pre-validated, fence-stripped SQL query and return rows."""
-    bounded_sql = _apply_row_limit(sql)
+    capped_sql = _apply_row_limit(sql)
     async with _get_pool().connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(bounded_sql)
+            await cur.execute(capped_sql)
             rows = await cur.fetchall()
             return [dict(row) for row in rows]
 
 
+_WORKSPACE_SCHEMA_CACHE: dict[str, str] = {}
+
+
 async def fetch_table_schema(tables: list[str]) -> str:
-    """Return a live schema description string for the given table names."""
     if not tables:
         return ""
-    async with _get_pool().connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT table_name, column_name, data_type "
-                "FROM information_schema.columns "
-                "WHERE table_schema = 'public' AND table_name = ANY(%s) "
-                "ORDER BY table_name, ordinal_position",
-                [tables],
-            )
-            rows = await cur.fetchall()
-
-    cols_by_table: dict[str, list[str]] = defaultdict(list)
-    for row in rows:
-        cols_by_table[row["table_name"]].append(f"{row['column_name']} {row['data_type']}")
-
-    return "\n".join(
-        f"- {table}({', '.join(cols_by_table[table])})"
-        for table in tables
-        if table in cols_by_table
-    )
+    cache_key = ",".join(tables)
+    if cache_key in _WORKSPACE_SCHEMA_CACHE:
+        return _WORKSPACE_SCHEMA_CACHE[cache_key]
+    schema_lines: list[str] = []
+    for table in tables:
+        async with _get_pool().connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT column_name, data_type FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = %s "
+                    "ORDER BY ordinal_position",
+                    (table,),
+                )
+                cols = await cur.fetchall()
+        if cols:
+            col_defs = ", ".join(f"{r[0]} {r[1]}" for r in cols)
+            schema_lines.append(f"{table}: {col_defs}")
+    schema = "\n".join(schema_lines)
+    _WORKSPACE_SCHEMA_CACHE[cache_key] = schema
+    return schema

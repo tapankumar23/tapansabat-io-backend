@@ -4,7 +4,6 @@ from collections import defaultdict, deque
 
 from fastapi import Request
 
-# Read once at startup; changing these requires a process restart.
 _MAX_REQUESTS: int = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "1"))
 _WINDOW_SECONDS: int = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 _EVICTION_INTERVAL: float = 3600.0

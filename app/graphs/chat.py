@@ -5,20 +5,17 @@ from langchain_core.messages import AnyMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
-from chat_persistence import get_checkpointer, initialize
-from model_factory import DEFAULT_PROVIDER, ProviderName, get_chat_model
+from app.models.factory import ProviderName, get_default_model, get_default_provider, get_llm
+from app.models.persistence import get_checkpointer, initialize
 
 
 class ChatState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
 
 
-@lru_cache(maxsize=16)
-def _compiled_chat_app(
-    provider: ProviderName = DEFAULT_PROVIDER,
-    model_name: str | None = None,
-) -> Any:
-    llm = get_chat_model(provider=provider, model_name=model_name)
+@lru_cache(maxsize=None)
+def _compiled_chat_app(provider: str, model: str) -> Any:
+    llm = get_llm(provider=ProviderName(provider), model=model)
 
     async def chatbot(state: ChatState) -> ChatState:
         response = await llm.ainvoke(state["messages"])
@@ -36,9 +33,8 @@ def clear_cache() -> None:
     _compiled_chat_app.cache_clear()
 
 
-async def get_chat_app_async(
-    provider: ProviderName = DEFAULT_PROVIDER,
-    model_name: str | None = None,
-) -> Any:
+async def get_chat_app_async(provider: str | None = None, model: str | None = None) -> Any:
     await initialize()
-    return _compiled_chat_app(provider=provider, model_name=model_name)
+    resolved_provider = provider or get_default_provider().value
+    resolved_model = model or get_default_model(resolved_provider)
+    return _compiled_chat_app(resolved_provider, resolved_model)
