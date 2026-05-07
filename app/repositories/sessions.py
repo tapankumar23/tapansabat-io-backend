@@ -11,7 +11,7 @@ class SessionConfig(BaseModel):
     model: str = "openrouter/free"
 
 
-async def _ensure_sessions_table() -> None:
+async def ensure_sessions_table() -> None:
     async with get_pool().connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -28,7 +28,6 @@ async def _ensure_sessions_table() -> None:
 
 
 async def get_session(session_id: str) -> SessionConfig | None:
-    await _ensure_sessions_table()
     async with get_pool().connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -42,7 +41,6 @@ async def get_session(session_id: str) -> SessionConfig | None:
 
 
 async def upsert_session(session_id: str, provider: str, model: str) -> SessionConfig:
-    await _ensure_sessions_table()
     async with get_pool().connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -62,7 +60,6 @@ async def upsert_session(session_id: str, provider: str, model: str) -> SessionC
 
 
 async def delete_session(session_id: str) -> bool:
-    await _ensure_sessions_table()
     async with get_pool().connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(

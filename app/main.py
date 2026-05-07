@@ -15,10 +15,13 @@ load_dotenv()
 from app.graphs.chat import clear_cache as clear_graph_cache
 from app.models.persistence import close as close_persistence, initialize as initialize_persistence
 from app.db.sql import close_pool as close_sql_pool, open_pool as open_sql_pool, ping_db
+from app.repositories.sessions import ensure_sessions_table
 from app.utils.rate_limit import RateLimitError
+from app.utils.stream_utils import request_id as get_request_id
 from app.api.chat import router as chat_router
 from app.api.sessions import router as sessions_router
 from app.api.models import router as models_router
+from app.api.streaming import router as streaming_router
 
 
 class _JsonFormatter(logging.Formatter):
@@ -54,6 +57,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(_: FastAPI):
     await initialize_persistence()
     await open_sql_pool()
+    await ensure_sessions_table()
     logger.info("Startup complete — Postgres ready, SQL pool open")
     try:
         yield
@@ -117,6 +121,7 @@ app.add_middleware(
 app.include_router(chat_router)
 app.include_router(sessions_router)
 app.include_router(models_router)
+app.include_router(streaming_router)
 
 
 @app.middleware("http")
@@ -128,16 +133,12 @@ async def attach_request_id(request: Request, call_next):
     return response
 
 
-def _request_id(request: Request) -> str:
-    return getattr(request.state, "request_id", "unknown")
-
-
 @app.exception_handler(RateLimitError)
 async def _handle_rate_limit(request: Request, exc: RateLimitError) -> JSONResponse:
     return JSONResponse(
         status_code=429,
         headers={"Retry-After": str(exc.retry_after)},
-        content={"detail": str(exc), "request_id": _request_id(request)},
+        content={"detail": str(exc), "request_id": get_request_id(request)},
     )
 
 
@@ -145,7 +146,7 @@ async def _handle_rate_limit(request: Request, exc: RateLimitError) -> JSONRespo
 async def _handle_value_error(request: Request, exc: ValueError) -> JSONResponse:
     return JSONResponse(
         status_code=400,
-        content={"detail": str(exc), "request_id": _request_id(request)},
+        content={"detail": str(exc), "request_id": get_request_id(request)},
     )
 
 

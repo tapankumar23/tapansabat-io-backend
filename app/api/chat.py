@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from app.service import ChatMode, ChatService, WorkflowService
 from app.utils.rate_limit import enforce as enforce_rate_limit
-from app.utils.stream_utils import sse_event
+from app.utils.stream_utils import request_id as get_request_id, sse_event
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -65,10 +65,6 @@ _session_service = ChatService()
 _workflow_service = WorkflowService()
 
 
-def _request_id(request: Request) -> str:
-    return getattr(request.state, "request_id", "unknown")
-
-
 @router.post(
     "/v1/chat",
     responses={
@@ -122,7 +118,7 @@ async def chat_stream(
     payload: ChatRequest,
     _: None = Depends(enforce_rate_limit),
 ) -> StreamingResponse:
-    request_id_val = _request_id(request)
+    request_id_val = get_request_id(request)
 
     async def event_stream():
         try:

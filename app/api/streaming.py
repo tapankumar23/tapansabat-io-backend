@@ -1,11 +1,12 @@
 import logging
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.service import WorkflowService
-from app.utils.stream_utils import sse_event
+from app.utils.rate_limit import enforce as enforce_rate_limit
+from app.utils.stream_utils import request_id as get_request_id, sse_event
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -40,12 +41,8 @@ _SSE_HEADERS = {
 }
 
 
-def _request_id(request: Request) -> str:
-    return getattr(request.state, "request_id", "unknown")
-
-
 @router.post("/v1/workflow", response_model=WorkflowResponse, tags=["Workflow"])
-async def chat_workflow(payload: WorkflowRequest) -> WorkflowResponse:
+async def chat_workflow(payload: WorkflowRequest, _: None = Depends(enforce_rate_limit)) -> WorkflowResponse:
     result = await _workflow_service.run(
         query=payload.query,
         workspace=payload.workspace,
@@ -56,7 +53,7 @@ async def chat_workflow(payload: WorkflowRequest) -> WorkflowResponse:
 
 
 @router.post("/v1/workflow/stream", response_model=None, tags=["Workflow"])
-async def stream_workflow(request: Request, payload: WorkflowRequest) -> StreamingResponse:
+async def stream_workflow(request: Request, payload: WorkflowRequest, _: None = Depends(enforce_rate_limit)) -> StreamingResponse:
     async def event_stream():
         try:
             async for event in _workflow_service.stream(
@@ -72,16 +69,16 @@ async def stream_workflow(request: Request, payload: WorkflowRequest) -> Streami
                     **({"detail": event.detail} if event.detail else {}),
                 })
         except ValueError as exc:
-            yield sse_event("error", {"detail": str(exc), "request_id": _request_id(request)})
+            yield sse_event("error", {"detail": str(exc), "request_id": get_request_id(request)})
         except Exception:
             logger.exception("Unhandled streaming workflow error")
-            yield sse_event("error", {"detail": "workflow request failed", "request_id": _request_id(request)})
+            yield sse_event("error", {"detail": "workflow request failed", "request_id": get_request_id(request)})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 @router.post("/v1/workflow/schema/stream", response_model=None, tags=["Workflow"])
-async def stream_schema_workflow(request: Request, payload: SchemaRequest) -> StreamingResponse:
+async def stream_schema_workflow(request: Request, payload: SchemaRequest, _: None = Depends(enforce_rate_limit)) -> StreamingResponse:
     async def event_stream():
         try:
             async for event in _workflow_service.stream(
@@ -97,10 +94,10 @@ async def stream_schema_workflow(request: Request, payload: SchemaRequest) -> St
                     **({"detail": event.detail} if event.detail else {}),
                 })
         except ValueError as exc:
-            yield sse_event("error", {"detail": str(exc), "request_id": _request_id(request)})
+            yield sse_event("error", {"detail": str(exc), "request_id": get_request_id(request)})
         except Exception:
             logger.exception("Unhandled schema workflow error")
-            yield sse_event("error", {"detail": "workflow request failed", "request_id": _request_id(request)})
+            yield sse_event("error", {"detail": "workflow request failed", "request_id": get_request_id(request)})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 

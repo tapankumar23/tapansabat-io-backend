@@ -136,3 +136,7 @@ def _compiled_workflow_graph(provider: str, model: str):
     return build_graph(provider, model)
 
 
+def get_workflow_graph(provider: str, model: str):
+    return _compiled_workflow_graph(provider, model)
+
+

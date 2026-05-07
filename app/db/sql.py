@@ -29,6 +29,9 @@ def is_safe_sql(sql: str) -> bool:
     cleaned = strip_sql_fences(sql).rstrip(";")
     if not cleaned:
         return False
+    # Reject multi-statement queries regardless of content
+    if ";" in cleaned:
+        return False
     tokens = cleaned.split()
     if not tokens or tokens[0].lower() not in _READONLY_KEYWORDS:
         return False
@@ -96,9 +99,9 @@ async def fetch_table_schema(tables: list[str]) -> str:
     if cache_key in _WORKSPACE_SCHEMA_CACHE:
         return _WORKSPACE_SCHEMA_CACHE[cache_key]
     schema_lines: list[str] = []
-    for table in tables:
-        async with get_pool().connection() as conn:
-            async with conn.cursor() as cur:
+    async with get_pool().connection() as conn:
+        async with conn.cursor() as cur:
+            for table in tables:
                 await cur.execute(
                     "SELECT column_name, data_type FROM information_schema.columns "
                     "WHERE table_schema = 'public' AND table_name = %s "
@@ -106,9 +109,9 @@ async def fetch_table_schema(tables: list[str]) -> str:
                     (table,),
                 )
                 cols = await cur.fetchall()
-        if cols:
-            col_defs = ", ".join(f"{r['column_name']} {r['data_type']}" for r in cols)
-            schema_lines.append(f"{table}: {col_defs}")
+                if cols:
+                    col_defs = ", ".join(f"{r['column_name']} {r['data_type']}" for r in cols)
+                    schema_lines.append(f"{table}: {col_defs}")
     schema = "\n".join(schema_lines)
     _WORKSPACE_SCHEMA_CACHE[cache_key] = schema
     return schema

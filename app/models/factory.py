@@ -82,13 +82,26 @@ def _resolve_provider_and_model(
 
 _llm_timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
 
-_DEFAULT_PROVIDER: ProviderName
-try:
-    _DEFAULT_PROVIDER = ProviderName(os.getenv("DEFAULT_PROVIDER", "groq").lower())
-    if _DEFAULT_PROVIDER not in _PROVIDER_CONFIGS or not _PROVIDER_CONFIGS[_DEFAULT_PROVIDER].api_key:
-        _DEFAULT_PROVIDER = ProviderName.GROQ
-except ValueError:
-    _DEFAULT_PROVIDER = ProviderName.GROQ
+def _resolve_default_provider() -> ProviderName:
+    requested = os.getenv("DEFAULT_PROVIDER", "").strip().lower()
+    if requested:
+        try:
+            candidate = ProviderName(requested)
+            if _PROVIDER_CONFIGS.get(candidate, ProviderConfig(candidate, "", "", "")).api_key:
+                return candidate
+        except ValueError:
+            pass
+    # Fall back to first provider with a configured key
+    for name, cfg in _PROVIDER_CONFIGS.items():
+        if cfg.api_key:
+            return name
+    raise RuntimeError(
+        "No LLM provider API key found. Set at least one of: "
+        "OPENROUTER_API_KEY, GLM_API_KEY, GEMINI_API_KEY, GROQ_API_KEY."
+    )
+
+
+_DEFAULT_PROVIDER: ProviderName = _resolve_default_provider()
 
 
 def get_llm(

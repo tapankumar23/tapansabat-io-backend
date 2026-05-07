@@ -1,5 +1,11 @@
 import json
 
+from fastapi import Request
+
+
+def request_id(request: Request) -> str:
+    return getattr(request.state, "request_id", "unknown")
+
 
 def sse_event(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"

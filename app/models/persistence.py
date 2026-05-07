@@ -1,10 +1,13 @@
 import asyncio
+import logging
 import os
 
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+logger = logging.getLogger(__name__)
 
 _DB_URL_ENV_VARS = ("LANGGRAPH_POSTGRES_URL", "DATABASE_URL", "SUPABASE_DB_URL")
 
@@ -60,7 +63,7 @@ async def initialize() -> None:
             if _auto_setup_enabled():
                 await checkpointer.setup()
         except Exception:
-            pass
+            logger.warning("LangGraph checkpoint table setup failed — tables may already exist or DB is read-only", exc_info=True)
         _checkpointer = checkpointer
 
 

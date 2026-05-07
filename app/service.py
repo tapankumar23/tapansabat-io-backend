@@ -8,7 +8,7 @@ from langchain_core.messages import HumanMessage
 
 from app.repositories.sessions import get_session, upsert_session
 from app.graphs.chat import get_chat_app_async
-from app.graphs.workflow import _compiled_workflow_graph
+from app.graphs.workflow import get_workflow_graph
 from app.models.factory import get_default_model, get_default_provider
 from app.utils.stream_utils import normalize_stream_part, stringify_message_content
 
@@ -68,18 +68,20 @@ async def _resolve_session_config(
 ) -> tuple[str, str]:
     stored = await get_session(session_id)
 
+    default_provider = get_default_provider().value
+    default_model = get_default_model()
     if provider is not None:
         resolved_provider = provider
-        resolved_model = model or (stored.model if stored else "openrouter/free")
+        resolved_model = model or (stored.model if stored else default_model)
     elif model is not None:
-        resolved_provider = stored.provider if stored else "openrouter"
+        resolved_provider = stored.provider if stored else default_provider
         resolved_model = model
     elif stored is not None:
         resolved_provider = stored.provider
         resolved_model = stored.model
     else:
-        resolved_provider = "openrouter"
-        resolved_model = "openrouter/free"
+        resolved_provider = default_provider
+        resolved_model = default_model
 
     await upsert_session(session_id, resolved_provider, resolved_model)
     return resolved_provider, resolved_model
@@ -149,8 +151,11 @@ class ChatService:
             if normalized is None:
                 continue
             match normalized.get("type"):
-                case "messages/iter":
-                    token = stringify_message_content(normalized.get("data", ""))
+                case "messages":
+                    chunk, _ = normalized.get("data")
+                    token = stringify_message_content(chunk.content)
+                    if not token:
+                        continue
                     final_reply += token
                     yield ChatStreamEvent(
                         event="token",
@@ -177,7 +182,7 @@ class ChatService:
 class WorkflowService:
     """Stateless intent-classified workflow — routes to SQL analytics or general chat."""
 
-    def __init__(self, graph_factory: WorkflowGraphFactory = _compiled_workflow_graph) -> None:
+    def __init__(self, graph_factory: WorkflowGraphFactory = get_workflow_graph) -> None:
         self._graph_factory = graph_factory
 
     async def run(
