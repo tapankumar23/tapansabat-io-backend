@@ -7,6 +7,7 @@ from langchain_core.messages import HumanMessage
 
 from chat_graph import get_chat_app_async
 from model_factory import DEFAULT_PROVIDER, ProviderName
+from stream_utils import normalize_stream_part, stringify_message_content
 
 
 class ChatAppFactory(Protocol):
@@ -52,14 +53,15 @@ class ChatService:
             session_id=session_id,
         )
         app = await self._app_factory(provider=provider, model_name=model_name)
+        config: dict = {"configurable": {"thread_id": active_session_id}}
         result = await app.ainvoke(
             {"messages": [HumanMessage(content=cleaned_message)]},
-            config={"configurable": {"thread_id": active_session_id}},
+            config=config,
         )
 
         return ChatResult(
             session_id=active_session_id,
-            reply=_stringify_message_content(result["messages"][-1].content),
+            reply=stringify_message_content(result["messages"][-1].content),
             provider=provider,
             model_name=model_name,
         )
@@ -77,6 +79,7 @@ class ChatService:
             session_id=session_id,
         )
         app = await self._app_factory(provider=provider, model_name=model_name)
+        config: dict = {"configurable": {"thread_id": active_session_id}}
         final_reply = ""
 
         yield ChatStreamEvent(
@@ -88,17 +91,17 @@ class ChatService:
 
         async for part in app.astream(
             {"messages": [HumanMessage(content=cleaned_message)]},
-            config={"configurable": {"thread_id": active_session_id}},
+            config=config,
             stream_mode=["messages", "values"],
             version="v2",
         ):
-            part = _normalize_stream_part(part)
+            part = normalize_stream_part(part)
             if part is None:
                 continue
 
             if part.get("type") == "messages":
                 message_chunk, _metadata = part["data"]
-                delta = _stringify_message_content(message_chunk.content)
+                delta = stringify_message_content(message_chunk.content)
                 if delta:
                     yield ChatStreamEvent(
                         event="token",
@@ -118,7 +121,7 @@ class ChatService:
 
             messages = state.get("messages")
             if isinstance(messages, list) and messages:
-                final_reply = _stringify_message_content(messages[-1].content)
+                final_reply = stringify_message_content(messages[-1].content)
 
         yield ChatStreamEvent(
             event="complete",
@@ -129,42 +132,9 @@ class ChatService:
         )
 
 
-def _normalize_stream_part(part: object) -> dict[str, object] | None:
-    if isinstance(part, dict):
-        return part
-
-    if (
-        isinstance(part, tuple)
-        and len(part) == 2
-        and isinstance(part[0], str)
-    ):
-        stream_type, data = part
-        return {"type": stream_type, "data": data}
-
-    return None
-
-
 def _normalize_chat_input(*, message: str, session_id: str | None) -> tuple[str, str]:
     cleaned_message = message.strip()
     if not cleaned_message:
         raise ValueError("message must not be empty")
     active_session_id = (session_id or "").strip() or uuid4().hex
     return cleaned_message, active_session_id
-
-
-def _stringify_message_content(content: object) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        text_parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                text_parts.append(item)
-                continue
-            if isinstance(item, dict) and item.get("type") == "text":
-                text = item.get("text")
-                if isinstance(text, str):
-                    text_parts.append(text)
-        if text_parts:
-            return "\n".join(text_parts)
-    return str(content)

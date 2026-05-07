@@ -5,11 +5,17 @@ from typing import Literal
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
-
 load_dotenv()
 
 ProviderName = Literal["glm", "openrouter", "gemini"]
-DEFAULT_PROVIDER: ProviderName = os.getenv("DEFAULT_PROVIDER", "gemini").strip()
+
+_VALID_PROVIDERS = frozenset({"glm", "openrouter", "gemini"})
+_raw_provider = os.getenv("DEFAULT_PROVIDER", "gemini").strip()
+if _raw_provider not in _VALID_PROVIDERS:
+    raise ValueError(
+        f"Invalid DEFAULT_PROVIDER '{_raw_provider}'. Must be one of: {', '.join(sorted(_VALID_PROVIDERS))}"
+    )
+DEFAULT_PROVIDER: ProviderName = _raw_provider  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -44,7 +50,7 @@ def get_chat_model(
     **kwargs,
 ) -> ChatOpenAI:
     config, api_key = get_provider_credentials(provider=provider)
-
+    kwargs.setdefault("timeout", float(os.getenv("LLM_TIMEOUT_SECONDS", "30")))
     return ChatOpenAI(
         model=model_name or config.default_model,
         api_key=api_key,
@@ -56,12 +62,8 @@ def get_chat_model(
 def get_provider_credentials(
     provider: ProviderName = DEFAULT_PROVIDER,
 ) -> tuple[ProviderConfig, str]:
-    load_dotenv()
-
     config = PROVIDER_CONFIGS[provider]
     api_key = os.getenv(config.env_var)
     if not api_key:
         raise ValueError(f"{config.env_var} is not set. Check your .env file.")
     return config, api_key
-
-

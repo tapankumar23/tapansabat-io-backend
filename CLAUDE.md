@@ -29,15 +29,17 @@ For Supabase, use a Postgres URI that includes `sslmode=require`. The first star
 ## Running the backend
 
 ```bash
-python chatbot_backend.py
+python chatbot_backend.py        # port 8000
+./run.sh                         # port 8001 via uvicorn directly
 ```
-
-This starts a FastAPI server on `http://0.0.0.0:8000` (overridable via `HOST`/`PORT` env vars).
 
 ## Configuration env vars
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `DEFAULT_PROVIDER` | `"gemini"` | Default LLM provider for chat endpoints |
+| `STREAMING_WORKFLOW_PROVIDER` | `"gemini"` | LLM provider used by the workflow graph |
+| `STREAMING_WORKFLOW_MODEL` | provider default | Model override for the workflow graph |
 | `MAX_MESSAGE_LENGTH` | `100` | Max characters allowed in a chat message |
 | `RATE_LIMIT_MAX_REQUESTS` | `1` | Requests allowed per window per client IP |
 | `RATE_LIMIT_WINDOW_SECONDS` | `300` | Sliding window duration in seconds |
@@ -45,9 +47,13 @@ This starts a FastAPI server on `http://0.0.0.0:8000` (overridable via `HOST`/`P
 | `LANGGRAPH_POSTGRES_URL` / `DATABASE_URL` / `SUPABASE_DB_URL` | unset | Supabase/Postgres connection string for persisted chat checkpoints |
 | `LANGGRAPH_POSTGRES_AUTO_SETUP` | `true` | Auto-create LangGraph checkpoint tables on startup |
 | `LOG_LEVEL` | `INFO` | Python logging level |
+| `LOG_FORMAT` | `text` | Set to `json` for structured JSON logging (e.g. in production) |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | Uvicorn bind address |
-| `STREAMING_WORKFLOW_PROVIDER` | `"gemini"` | LLM provider used by the workflow graph |
-| `STREAMING_WORKFLOW_MODEL` | provider default | Model override for the workflow graph |
+| `LLM_TIMEOUT_SECONDS` | `30` | Timeout for every LLM API call |
+| `SQL_MAX_ROWS` | `500` | Hard cap on rows returned per SQL query (a `LIMIT` is appended automatically) |
+| `SQL_POOL_SIZE` | `5` | Max connections in the `workflow_sql` pool |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | unset | Enables Langfuse tracing; omit to run without tracing |
+| `LANGFUSE_HOST` | Langfuse cloud | Override for self-hosted Langfuse (e.g. `http://localhost:3000`) |
 
 ## Example requests
 
@@ -65,38 +71,61 @@ curl -X POST http://127.0.0.1:8000/v1/chat/stream \
 # Stateless workflow (blocking)
 curl -X POST http://127.0.0.1:8000/v1/workflow \
   -H 'Content-Type: application/json' \
-  -d '{"query":"How many shipments left BLR today?"}'
+  -d '{"query":"How many shipments left BLR today?","workspace":"general"}'
 
 # Stateless workflow (SSE streaming — emits node/complete/error events)
 curl -X POST http://127.0.0.1:8000/v1/workflow/stream \
   -H 'Content-Type: application/json' \
-  -d '{"query":"How many shipments left BLR today?"}'
+  -d '{"query":"How many shipments left BLR today?","workspace":"general"}'
+
+# Schema-aware SQL workflow (SSE — same graph, defaults workspace to "logistics-schema")
+curl -X POST http://127.0.0.1:8000/v1/workflow/schema/stream \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"How many shipments left BLR today?","workspace":"logistics-schema"}'
+
+# List configured providers and models
+curl http://127.0.0.1:8000/v1/models
 ```
 
 ## Architecture
 
-Seven modules, each with a single responsibility:
+Eleven modules, each with a single responsibility:
 
-- **[model_factory.py](model_factory.py)** — Provider abstraction. `PROVIDER_CONFIGS` maps `ProviderName` (`"glm"`, `"openrouter"`, `"gemini"`) to API base URLs and env var names. All three providers use the OpenAI-compatible `ChatOpenAI` client with different `base_url` values. `get_provider_credentials(provider)` returns `(ProviderConfig, api_key)`; `get_chat_model(provider, model_name)` wraps it. Calls `load_dotenv()` internally so it is self-contained when used from scripts or notebooks.
+- **[model_factory.py](model_factory.py)** — Provider abstraction. `PROVIDER_CONFIGS` maps `ProviderName` (`"glm"`, `"openrouter"`, `"gemini"`) to API base URLs and env var names. All three providers use the OpenAI-compatible `ChatOpenAI` client. `DEFAULT_PROVIDER` is validated at import time — an invalid value raises immediately. `get_chat_model` applies `LLM_TIMEOUT_SECONDS` (default 30s) to every LLM call via `kwargs.setdefault`.
 
-- **[chat_persistence.py](chat_persistence.py)** — Postgres checkpointer lifecycle. Owns the module-level `AsyncPostgresSaver` singleton. `initialize()` opens the connection and optionally runs `setup()`; `close()` tears it down. `get_checkpointer()` returns the live instance for graph compilation. Uses double-checked locking (`threading.Lock` wrapping `asyncio.Lock`) to safely initialize the singleton across concurrent async callers.
+- **[stream_utils.py](stream_utils.py)** — Shared streaming/content utilities. `sse_event(event, data)` is the single source of truth for SSE formatting (used by both `chatbot_backend.py` and `streaming_workflow_api.py`). `normalize_stream_part` normalises the `(type, data)` tuple vs dict variants from LangGraph's multi-mode `astream`. `stringify_message_content` flattens string or list-of-content-blocks into plain text.
 
-- **[chat_graph.py](chat_graph.py)** — Stateful LangGraph graph factory. `get_chat_app_async(provider, model_name)` ensures persistence is initialized then returns an `@lru_cache`d compiled `StateGraph` (up to 16 entries). The graph is a single `chatbot` node that appends to a `messages` list; Postgres checkpointing gives it multi-turn memory keyed by `thread_id`. `clear_cache()` is called on shutdown.
+- **[chat_persistence.py](chat_persistence.py)** — Postgres checkpointer lifecycle. Owns the module-level `AsyncPostgresSaver` singleton. `initialize()` opens the connection and optionally runs `setup()`; `close()` tears it down. Exports `get_database_url()` (reads the three DB URL env vars) which is also consumed by `workflow_sql.py`.
 
-- **[chat_service.py](chat_service.py)** — Service layer. `ChatService` accepts an injected `ChatAppFactory` (a `Protocol`) so the graph backend is swappable without modifying the service. `achat()` normalizes input, invokes the graph, and returns a `ChatResult`. `astream()` yields `ChatStreamEvent` objects (`start` / `token` / `complete`) using LangGraph's `messages` + `values` dual stream mode. Two private helpers—`_normalize_stream_part` and `_stringify_message_content`—are also imported and reused by `streaming_workflow_api.py`.
+- **[chat_graph.py](chat_graph.py)** — Stateful LangGraph graph factory. `get_chat_app_async(provider, model_name)` returns an `@lru_cache`d compiled `StateGraph` (up to 16 entries). The graph is a single `chatbot` node that appends to a `messages` list; Postgres checkpointing gives it multi-turn memory keyed by `thread_id`.
 
-- **[streaming_workflow_api.py](streaming_workflow_api.py)** — Stateless multi-step LangGraph workflow mounted as a FastAPI `APIRouter`. The graph classifies each query into `analytics`, `action`, or `chat` intent, then routes through dedicated node chains: analytics → `metric_resolver → sql_generator → query_tool → formatter`; action → `intent_parser → validate → tool_caller → action_formatter`; chat → `chat_node`. Unlike `chat_graph.py`, this graph has no checkpointer (stateless per request). The `POST /v1/workflow/stream` endpoint emits SSE `node` events for each graph step plus a final `complete` event.
+- **[chat_service.py](chat_service.py)** — Stateful chat service layer. `ChatService` accepts an injected `ChatAppFactory` (a `Protocol`) so the graph backend is swappable. `achat()` returns a `ChatResult`; `astream()` yields `ChatStreamEvent` objects (`start` / `token` / `complete`).
 
-- **[rate_limit.py](rate_limit.py)** — Sliding-window rate limiter. `enforce(request)` reads `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS` from env on each call and raises `RateLimitError` when the per-IP limit is exceeded. State is in-process only — not shared across workers.
+- **[workflow_sql.py](workflow_sql.py)** — SQL safety, execution, and connection pooling. `is_safe_sql` validates read-only queries; `strip_sql_fences` removes LLM markdown fences; `_apply_row_limit` appends `LIMIT SQL_MAX_ROWS` if absent (prevents OOM from unbounded queries). `execute_sql` and `fetch_table_schema` share an `AsyncConnectionPool` (`psycopg_pool`) sized by `SQL_POOL_SIZE`. Call `open_pool()` / `close_pool()` in the app lifespan. `ping_db()` is used by `/readyz`.
 
-- **[chatbot_backend.py](chatbot_backend.py)** — FastAPI entry point. Exposes `/`, `/healthz`, `/readyz`, `POST /v1/chat`, `POST /v1/chat/stream`, and mounts the workflow router (`/v1/workflow`, `/v1/workflow/stream`). `load_dotenv()` runs before local imports so env vars are available to all modules at import time. Lifespan validates credentials and initializes persistence on startup; closes and clears the graph cache on shutdown. `ValueError` → 400, `RateLimitError` → 429 with `Retry-After`, unhandled → 502. Every response carries an `x-request-id` header for tracing.
+- **[workflow_graph.py](workflow_graph.py)** — Stateless workflow graph. Defines `GraphState` (includes `workspace` and `schema_context`), the `get_llm()` singleton, and all node functions: `classify` (routes to `analytics` or `general`), `metric_resolver` (fetches live schema for the workspace via `fetch_table_schema`), `sql_generator`, `query_tool_async`, `formatter`, `chat_node`. `_WORKSPACE_TABLES` maps workspace names to the DB tables they may query — add a table name here to expose it, no column definitions needed. The compiled `graph` is a module-level singleton.
 
-The default provider is `"gemini"`. To use a different provider, pass `"provider"` in the `/v1/chat` JSON body.
+- **[streaming_workflow_api.py](streaming_workflow_api.py)** — FastAPI router for workflow endpoints. `SchemaRequest` extends `WorkflowRequest` with a different `workspace` default (`"logistics-schema"`). All three endpoints share `_initial_state()` and `_langfuse_config()` helpers and use the same `graph`. Every SSE error event includes a `request_id` for traceability. SSE formatting uses `sse_event` from `stream_utils`.
+
+- **[langfuse_utils.py](langfuse_utils.py)** — Langfuse tracing integration. `get_langfuse_handler()` returns a per-request `CallbackHandler` when `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set, or `None` otherwise. The handler is passed via `config={"callbacks": [...]}` at every graph and LLM call site so tracing is fully optional with no code changes.
+
+- **[rate_limit.py](rate_limit.py)** — Sliding-window rate limiter. `_MAX_REQUESTS` and `_WINDOW_SECONDS` are read once at import time (changing them requires a restart). `_evict_stale()` runs hourly to remove dead IP buckets and prevent unbounded memory growth. State is in-process only — not shared across workers.
+
+- **[chatbot_backend.py](chatbot_backend.py)** — FastAPI entry point. Exposes `/`, `/healthz`, `/readyz` (checks both API keys and DB connectivity via `ping_db`), `GET /v1/models`, `POST /v1/chat`, `POST /v1/chat/stream`, and mounts the workflow router. App lifespan opens/closes the SQL pool alongside Postgres persistence. `RateLimitError` → 429 with `Retry-After`, `ValueError` → 400, unhandled → 502. Every response carries a server-generated `x-request-id`. Supports JSON structured logging via `LOG_FORMAT=json`.
+
+## LangGraph Studio
+
+`langgraph.json` exposes the workflow `graph` for visual debugging:
+
+```bash
+source .venv/bin/activate
+langgraph dev   # opens Studio UI, requires LANGSMITH_API_KEY in .env
+```
 
 ## Development notes
 
-There are no tests or linting configuration in this repository. When adding them, note that `chat_service.py` uses `ChatAppFactory` (a `typing.Protocol`) for dependency injection, making `ChatService` testable with a mock factory without touching the graph or Postgres.
+There are no tests or linting configuration in this repository. `chat_service.py` uses `ChatAppFactory` (a `typing.Protocol`) for dependency injection, making `ChatService` testable with a mock factory without touching the graph or Postgres. `workflow_sql.execute_sql` can similarly be patched in isolation for workflow tests.
 
 ## Deployment caveat
 
-The rate limiter (`_buckets` in `rate_limit.py`) and the compiled graph cache (`lru_cache` in `chat_graph.py`) are in-process. Running multiple uvicorn workers (e.g. `--workers 4`) breaks per-IP rate limiting and means each worker builds its own graph cache independently. Use a single worker or externalize rate limiting (e.g. via a reverse proxy) for multi-worker deployments.
+The rate limiter (`_buckets` in `rate_limit.py`) and the compiled graph cache (`lru_cache` in `chat_graph.py` and `workflow_graph.py`) are in-process. Running multiple uvicorn workers breaks per-IP rate limiting and means each worker builds its own caches independently. Use a single worker or externalize rate limiting (e.g. via a reverse proxy) for multi-worker deployments.

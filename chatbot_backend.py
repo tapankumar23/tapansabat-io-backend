@@ -1,13 +1,13 @@
+import json
 import logging
 import os
-import json
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -17,31 +17,72 @@ from chat_persistence import close as close_persistence  # noqa: E402
 from chat_persistence import initialize as initialize_persistence  # noqa: E402
 from chat_service import ChatService  # noqa: E402
 from model_factory import DEFAULT_PROVIDER, PROVIDER_CONFIGS, ProviderName, get_provider_credentials  # noqa: E402
-from rate_limit import enforce as enforce_rate_limit  # noqa: E402
+from rate_limit import RateLimitError, enforce as enforce_rate_limit  # noqa: E402
+from stream_utils import sse_event  # noqa: E402
 from streaming_workflow_api import router as workflow_router  # noqa: E402
-
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
-logger = logging.getLogger(__name__)
+from workflow_sql import close_pool as close_sql_pool  # noqa: E402
+from workflow_sql import open_pool as open_sql_pool  # noqa: E402
+from workflow_sql import ping_db  # noqa: E402
 
 MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "100"))
 
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        obj: dict[str, object] = {
+            "ts": self.formatTime(record),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            obj["exc"] = self.formatException(record.exc_info)
+        return json.dumps(obj)
+
+
+def _configure_logging() -> None:
+    level = os.getenv("LOG_LEVEL", "INFO")
+    fmt = os.getenv("LOG_FORMAT", "text").lower()
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        _JsonFormatter()
+        if fmt == "json"
+        else logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    logging.basicConfig(level=level, handlers=[handler], force=True)
+
+
+_configure_logging()
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# App lifespan
+# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     for provider in PROVIDER_CONFIGS:
         get_provider_credentials(provider)
     await initialize_persistence()
-    logger.info("All provider credentials verified")
-    logger.info("Postgres chat persistence initialized")
+    await open_sql_pool()
+    logger.info("Startup complete — credentials verified, Postgres ready, SQL pool open")
     try:
         yield
     finally:
         await close_persistence()
+        await close_sql_pool()
         clear_graph_cache()
+        logger.info("Shutdown complete")
 
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
 
 class HealthResponse(BaseModel):
     status: str = "ok"
@@ -79,6 +120,10 @@ class ModelsResponse(BaseModel):
     providers: dict[ProviderName, ModelInfo]
 
 
+# ---------------------------------------------------------------------------
+# App + middleware
+# ---------------------------------------------------------------------------
+
 service = ChatService()
 app = FastAPI(title="AI Chatbot Backend", version="1.0.0", lifespan=lifespan)
 
@@ -86,7 +131,8 @@ _cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",")]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_credentials=True,
+    # allow_credentials intentionally omitted: this API uses no cookies or
+    # auth headers that require credentialed cross-origin requests.
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -95,7 +141,7 @@ app.include_router(workflow_router)
 
 @app.middleware("http")
 async def attach_request_id(request: Request, call_next):
-    request_id = request.headers.get("x-request-id") or uuid4().hex
+    request_id = uuid4().hex  # never trust client-supplied IDs for internal tracking
     request.state.request_id = request_id
     response = await call_next(request)
     response.headers["x-request-id"] = request_id
@@ -106,9 +152,30 @@ def _request_id(request: Request) -> str:
     return getattr(request.state, "request_id", "unknown")
 
 
-def _sse_event(event: str, data: dict[str, object]) -> str:
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+# ---------------------------------------------------------------------------
+# Exception handlers
+# ---------------------------------------------------------------------------
 
+@app.exception_handler(RateLimitError)
+async def _handle_rate_limit(request: Request, exc: RateLimitError) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        headers={"Retry-After": str(exc.retry_after)},
+        content={"detail": str(exc), "request_id": _request_id(request)},
+    )
+
+
+@app.exception_handler(ValueError)
+async def _handle_value_error(request: Request, exc: ValueError) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={"detail": str(exc), "request_id": _request_id(request)},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.get("/", response_model=HealthResponse)
 @app.get("/healthz", response_model=HealthResponse)
@@ -117,9 +184,10 @@ def healthz() -> HealthResponse:
 
 
 @app.get("/readyz", response_model=HealthResponse)
-def readyz() -> HealthResponse:
+async def readyz() -> HealthResponse:
     for provider in PROVIDER_CONFIGS:
         get_provider_credentials(provider)
+    await ping_db()
     return HealthResponse()
 
 
@@ -159,7 +227,6 @@ async def chat(
         provider=payload.provider,
         model_name=payload.model_name,
     )
-
     return ChatResponse(
         session_id=result.session_id,
         reply=result.reply,
@@ -182,6 +249,8 @@ async def chat_stream(
     payload: ChatRequest,
     _: None = Depends(enforce_rate_limit),
 ) -> StreamingResponse:
+    request_id = _request_id(request)
+
     async def event_stream():
         try:
             async for event in service.astream(
@@ -193,7 +262,7 @@ async def chat_stream(
                 if await request.is_disconnected():
                     return
 
-                event_payload = {
+                event_payload: dict[str, object] = {
                     "session_id": event.session_id,
                     "provider": event.provider,
                     "model_name": event.model_name,
@@ -203,18 +272,12 @@ async def chat_stream(
                 if event.reply:
                     event_payload["reply"] = event.reply
 
-                yield _sse_event(event.event, event_payload)
+                yield sse_event(event.event, event_payload)
         except ValueError as exc:
-            yield _sse_event(
-                "error",
-                {"detail": str(exc), "request_id": _request_id(request)},
-            )
+            yield sse_event("error", {"detail": str(exc), "request_id": request_id})
         except Exception:
             logger.exception("Unhandled chatbot stream error")
-            yield _sse_event(
-                "error",
-                {"detail": "chat request failed", "request_id": _request_id(request)},
-            )
+            yield sse_event("error", {"detail": "chat request failed", "request_id": request_id})
 
     return StreamingResponse(
         event_stream(),

@@ -4,6 +4,11 @@ from collections import defaultdict, deque
 
 from fastapi import Request
 
+# Read once at startup; changing these requires a process restart.
+_MAX_REQUESTS: int = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "1"))
+_WINDOW_SECONDS: int = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+_EVICTION_INTERVAL: float = 3600.0
+
 
 class RateLimitError(Exception):
     def __init__(self, retry_after: int) -> None:
@@ -12,6 +17,7 @@ class RateLimitError(Exception):
 
 
 _buckets: dict[str, deque] = defaultdict(deque)
+_last_eviction: float = 0.0
 
 
 def _client_ip(request: Request) -> str:
@@ -21,19 +27,29 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def enforce(request: Request) -> None:
-    max_requests = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "1"))
-    window_seconds = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+def _evict_stale(now: float) -> None:
+    global _last_eviction
+    if now - _last_eviction < _EVICTION_INTERVAL:
+        return
+    _last_eviction = now
+    window_start = now - _WINDOW_SECONDS
+    stale = [ip for ip, b in _buckets.items() if not b or b[-1] < window_start]
+    for ip in stale:
+        del _buckets[ip]
 
-    ip = _client_ip(request)
+
+def enforce(request: Request) -> None:
     now = time.monotonic()
-    window_start = now - window_seconds
+    window_start = now - _WINDOW_SECONDS
+    ip = _client_ip(request)
     bucket = _buckets[ip]
 
     while bucket and bucket[0] < window_start:
         bucket.popleft()
 
-    if len(bucket) >= max_requests:
+    _evict_stale(now)
+
+    if len(bucket) >= _MAX_REQUESTS:
         retry_after = int(bucket[0] - window_start) + 1
         raise RateLimitError(retry_after)
 

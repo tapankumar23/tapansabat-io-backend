@@ -8,7 +8,6 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 _DB_URL_ENV_VARS = ("LANGGRAPH_POSTGRES_URL", "DATABASE_URL", "SUPABASE_DB_URL")
 
-_checkpointer_cm = None
 _checkpointer: AsyncPostgresSaver | None = None
 _lock: asyncio.Lock | None = None
 
@@ -41,7 +40,7 @@ def _get_lock() -> asyncio.Lock:
 
 
 async def initialize() -> None:
-    global _checkpointer_cm, _checkpointer
+    global _checkpointer
 
     if _checkpointer is not None:
         return
@@ -60,22 +59,19 @@ async def initialize() -> None:
         try:
             if _auto_setup_enabled():
                 await checkpointer.setup()
-        except Exception:
+        except Exception as exc:
             await conn.close()
-            raise
+            raise RuntimeError("Failed to initialise Postgres checkpointer") from exc
 
         _checkpointer = checkpointer
-        _checkpointer_cm = None
 
 
 async def close() -> None:
-    global _checkpointer_cm, _checkpointer
+    global _checkpointer
 
     async with _get_lock():
         if _checkpointer is None:
-            _checkpointer_cm = None
             return
 
         await _checkpointer.conn.close()
         _checkpointer = None
-        _checkpointer_cm = None
