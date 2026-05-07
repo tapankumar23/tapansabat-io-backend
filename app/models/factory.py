@@ -10,6 +10,8 @@ load_dotenv()
 
 class ProviderName(str, Enum):
     OPENROUTER = "openrouter"
+    OPENROUTER_FREEISH = "openrouter_freeish"
+    GROQ = "groq"
     ZHIPU = "zhipu"
     GEMINI = "gemini"
 
@@ -29,6 +31,12 @@ _PROVIDER_CONFIGS: dict[ProviderName, ProviderConfig] = {
         base_url="https://openrouter.ai/api/v1",
         default_model="openrouter/free",
     ),
+    ProviderName.OPENROUTER_FREEISH: ProviderConfig(
+        name=ProviderName.OPENROUTER_FREEISH,
+        api_key=os.getenv("OPENROUTER_API_KEY", "").strip(),
+        base_url="https://openrouter.ai/api/v1",
+        default_model="meta-llama/llama-3-8b-instruct",
+    ),
     ProviderName.ZHIPU: ProviderConfig(
         name=ProviderName.ZHIPU,
         api_key=os.getenv("GLM_API_KEY", "").strip(),
@@ -41,6 +49,12 @@ _PROVIDER_CONFIGS: dict[ProviderName, ProviderConfig] = {
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         default_model="gemini-2.0-flash",
     ),
+    ProviderName.GROQ: ProviderConfig(
+        name=ProviderName.GROQ,
+        api_key=os.getenv("GROQ_API_KEY", "").strip(),
+        base_url="https://api.groq.com/openai/v1",
+        default_model="llama-3.1-8b-instant",
+    ),
 }
 
 
@@ -49,7 +63,7 @@ def _resolve_provider_and_model(
     model: str | None,
 ) -> tuple[ProviderName, str]:
     if provider is None:
-        resolved = ProviderName.OPENROUTER
+        resolved = _DEFAULT_PROVIDER
     elif isinstance(provider, str):
         resolved = ProviderName(provider.lower())
     else:
@@ -67,6 +81,14 @@ def _resolve_provider_and_model(
 
 
 _llm_timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
+
+_DEFAULT_PROVIDER: ProviderName
+try:
+    _DEFAULT_PROVIDER = ProviderName(os.getenv("DEFAULT_PROVIDER", "groq").lower())
+    if _DEFAULT_PROVIDER not in _PROVIDER_CONFIGS or not _PROVIDER_CONFIGS[_DEFAULT_PROVIDER].api_key:
+        _DEFAULT_PROVIDER = ProviderName.GROQ
+except ValueError:
+    _DEFAULT_PROVIDER = ProviderName.GROQ
 
 
 def get_llm(
@@ -91,11 +113,11 @@ _DEFAULT_MODEL_OVERRIDES: dict[ProviderName, str] = {}
 
 
 def get_default_provider() -> ProviderName:
-    return ProviderName.OPENROUTER
+    return _DEFAULT_PROVIDER
 
 
 def get_default_model(provider: ProviderName | str | None = None) -> str:
-    prov = provider or ProviderName.OPENROUTER
+    prov = provider or _DEFAULT_PROVIDER
     if isinstance(prov, str):
         prov = ProviderName(prov.lower())
     if prov not in _PROVIDER_CONFIGS:

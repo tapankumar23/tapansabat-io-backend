@@ -3,7 +3,8 @@
     "allow": [
       "Bash(pip list *)",
       "Bash(pip show *)",
-      "Read(//Users/tapansabat/.claude/plugins/cache/claude-plugins-official/superpowers/5.1.0/skills/requesting-code-review/**)"
+      "Read(//Users/tapansabat/.claude/plugins/cache/claude-plugins-official/superpowers/5.1.0/skills/requesting-code-review/**)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app/graphs/workflow.py'\\).read\\(\\)\\); ast.parse\\(open\\('app/prompts.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }

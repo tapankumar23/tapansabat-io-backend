@@ -167,9 +167,9 @@ async def chat_stream(
 
         except ValueError as exc:
             yield sse_event("error", {"detail": str(exc), "request_id": request_id_val})
-        except Exception:
+        except Exception as exc:
             logger.exception("Unhandled chat stream error")
-            yield sse_event("error", {"detail": "chat request failed", "request_id": request_id_val})
+            yield sse_event("error", {"detail": str(exc), "request_id": request_id_val})
 
     return StreamingResponse(
         event_stream(),

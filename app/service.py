@@ -219,8 +219,11 @@ class WorkflowService:
         )
 
         final_result = ""
-        async for state in graph.astream({"user_query": cleaned, "workspace": workspace}):
-            if isinstance(state, dict) and "result" in state:
+        async for state in graph.astream(
+            {"user_query": cleaned, "workspace": workspace},
+            stream_mode="values",
+        ):
+            if isinstance(state, dict) and state.get("result"):
                 final_result = state["result"]
 
         yield WorkflowStreamEvent(

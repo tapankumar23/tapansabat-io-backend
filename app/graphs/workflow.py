@@ -7,6 +7,7 @@ from langgraph.graph import END, StateGraph
 
 from app.models.factory import ProviderName, get_llm
 from app.db.sql import execute_sql, fetch_table_schema, is_safe_sql, strip_sql_fences
+from app.prompts import CLASSIFY_INTENT, FORMAT_RESULT, SQL_GENERATE
 from app.utils.stream_utils import stringify_message_content
 
 logger = logging.getLogger(__name__)
@@ -33,19 +34,7 @@ def _get_llm(provider: str, model: str):
 
 
 def classify(state: GraphState, llm) -> GraphState:
-    prompt = ChatPromptTemplate.from_template(
-        """Classify the user query into one of:
-- analytics
-- general
-
-Analytics: questions about shipments, hubs, counts, metrics, or anything answerable by SQL against the schema.
-General: casual conversation, greetings, or anything not covered by analytics.
-
-Query: {query}
-
-Return only one word.
-"""
-    )
+    prompt = ChatPromptTemplate.from_template(CLASSIFY_INTENT)
     response = llm.invoke(prompt.invoke({"query": state["user_query"]}))
     intent = response.content.strip().lower()
     if intent not in {"analytics", "general"}:
@@ -62,16 +51,7 @@ async def metric_resolver(state: GraphState) -> GraphState:
 def sql_generator(state: GraphState, llm) -> GraphState:
     schema_context = state.get("schema_context") or ""
     schema_section = f"Tables:\n{schema_context}" if schema_context else "(No schema available for this workspace.)"
-    prompt = ChatPromptTemplate.from_template(
-        """Generate a safe SQL query for PostgreSQL.
-
-{schema_section}
-
-Query: {query}
-
-Return only SQL.
-"""
-    )
+    prompt = ChatPromptTemplate.from_template(SQL_GENERATE)
     response = llm.invoke(prompt.invoke({"query": state["user_query"], "schema_section": schema_section}))
     return {**state, "parsed": {"sql": response.content.strip()}}
 
@@ -91,13 +71,7 @@ async def query_tool_async(state: GraphState) -> GraphState:
 
 
 def formatter(state: GraphState, llm) -> GraphState:
-    prompt = ChatPromptTemplate.from_template(
-        """Format this result into a user-friendly answer:
-
-Query: {query}
-Result: {result}
-"""
-    )
+    prompt = ChatPromptTemplate.from_template(FORMAT_RESULT)
     response = llm.invoke(
         prompt.invoke({"query": state["user_query"], "result": state["result"]})
     )
