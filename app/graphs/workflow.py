@@ -5,7 +5,7 @@ from typing import TypedDict
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, StateGraph
 
-from app.models.factory import ProviderName, get_llm
+from app.models.factory import ProviderName, get_default_model, get_default_provider, get_llm
 from app.db.sql import execute_sql, fetch_table_schema, is_safe_sql, strip_sql_fences
 from app.prompts import CLASSIFY_INTENT, FORMAT_RESULT, SQL_GENERATE
 from app.utils.stream_utils import stringify_message_content
@@ -138,5 +138,8 @@ def _compiled_workflow_graph(provider: str, model: str):
 
 def get_workflow_graph(provider: str, model: str):
     return _compiled_workflow_graph(provider, model)
+
+
+graph = build_graph(get_default_provider().value, get_default_model())
 
 

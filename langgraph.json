@@ -1,7 +1,8 @@
 {
   "dependencies": ["."],
   "graphs": {
-    "workflow": "./workflow_graph.py:graph"
+    "chat": "app/graphs/chat.py:graph",
+    "workflow": "app/graphs/workflow.py:graph"
   },
   "env": ".env"
 }

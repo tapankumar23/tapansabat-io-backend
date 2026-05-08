@@ -37,3 +37,20 @@ async def get_chat_app_async(provider: str | None = None, model: str | None = No
     resolved_provider = provider or get_default_provider().value
     resolved_model = model or get_default_model(resolved_provider)
     return _compiled_chat_app(resolved_provider, resolved_model)
+
+
+def _build_studio_graph(provider: str, model: str) -> Any:
+    llm = get_llm(provider=ProviderName(provider), model=model)
+
+    async def chatbot(state: ChatState) -> ChatState:
+        response = await llm.ainvoke(state["messages"])
+        return {"messages": [response]}
+
+    g = StateGraph(ChatState)
+    g.add_node("chatbot", chatbot)
+    g.add_edge(START, "chatbot")
+    g.add_edge("chatbot", END)
+    return g.compile()
+
+
+graph = _build_studio_graph(get_default_provider().value, get_default_model())
