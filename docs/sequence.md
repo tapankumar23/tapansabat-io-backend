@@ -1,6 +1,5 @@
 # API Sequence Diagram
 
-<div style="width:100%;overflow-x:auto">
 
 ```mermaid
 sequenceDiagram
@@ -119,8 +118,6 @@ sequenceDiagram
     C->>API: PATCH /v1/providers/{provider}/default-model
     API-->>C: {provider, default_model}  (in-memory update)
 ```
-
-</div>
 
 ## Endpoint Reference
 
