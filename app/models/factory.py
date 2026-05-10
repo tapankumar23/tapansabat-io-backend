@@ -82,6 +82,33 @@ def _resolve_provider_and_model(
 
 _llm_timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
 
+
+_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nvidia/llama-nemotron-embed-vl-1b-v2:free")
+_EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "2048"))
+
+
+def get_embedding_config() -> tuple[str, str, int]:
+    provider = os.getenv("EMBEDDING_PROVIDER", "openrouter").strip().lower()
+    if provider == "openrouter":
+        api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        base_url = "https://openrouter.ai/api/v1"
+    elif provider == "groq":
+        api_key = os.getenv("GROQ_API_KEY", "").strip()
+        base_url = "https://api.groq.com/openai/v1"
+    else:
+        raise ValueError(f"Unsupported embedding provider: {provider}. Supported: openrouter, groq")
+    if not api_key:
+        raise RuntimeError(f"API key not set for embedding provider '{provider}'")
+    return api_key, base_url, _EMBEDDING_DIM
+
+
+def get_embedding_model() -> str:
+    return _EMBEDDING_MODEL
+
+
+def get_embedding_dimension() -> int:
+    return _EMBEDDING_DIM
+
 def _resolve_default_provider() -> ProviderName:
     requested = os.getenv("DEFAULT_PROVIDER", "").strip().lower()
     if requested:

@@ -6,6 +6,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, StateGraph
 
 from app.models.factory import ProviderName, get_default_model, get_default_provider, get_llm
+from app.db.embeddings import query_similar_tables
 from app.db.sql import execute_sql, fetch_table_schema, is_safe_sql, strip_sql_fences
 from app.prompts import CLASSIFY_INTENT, FORMAT_RESULT, SQL_GENERATE
 from app.utils.stream_utils import stringify_message_content
@@ -43,8 +44,13 @@ def classify(state: GraphState, llm) -> GraphState:
 
 
 async def metric_resolver(state: GraphState) -> GraphState:
-    tables = _WORKSPACE_TABLES.get(state["workspace"], [])
-    schema = await fetch_table_schema(tables)
+    workspace = state["workspace"]
+    query = state["user_query"]
+    similar = await query_similar_tables(workspace=workspace, query=query, top_k=3)
+    if not similar:
+        return {**state, "schema_context": ""}
+    table_names = [t.table_name for t in similar]
+    schema = await fetch_table_schema(table_names)
     return {**state, "schema_context": schema}
 
 

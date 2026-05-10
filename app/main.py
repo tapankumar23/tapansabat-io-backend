@@ -15,6 +15,7 @@ load_dotenv()
 from app.graphs.chat import clear_cache as clear_graph_cache
 from app.models.persistence import close as close_persistence, initialize as initialize_persistence
 from app.db.sql import close_pool as close_sql_pool, open_pool as open_sql_pool, ping_db
+from app.db.indexer import index_all_workspaces
 from app.repositories.sessions import ensure_sessions_table
 from app.utils.rate_limit import RateLimitError
 from app.utils.stream_utils import request_id as get_request_id
@@ -58,7 +59,8 @@ async def lifespan(_: FastAPI):
     await initialize_persistence()
     await open_sql_pool()
     await ensure_sessions_table()
-    logger.info("Startup complete — Postgres ready, SQL pool open")
+    await index_all_workspaces()
+    logger.info("Startup complete — Postgres ready, SQL pool open, schema embeddings indexed")
     try:
         yield
     finally:
