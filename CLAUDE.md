@@ -52,6 +52,9 @@ python app/main.py    # port 8000
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | Uvicorn bind address |
 | `SQL_MAX_ROWS` | `500` | Hard cap on rows returned per SQL query |
 | `SQL_POOL_SIZE` | `5` | Max connections in the SQL pool |
+| `EMBEDDING_PROVIDER` | `openrouter` | Provider for embedding API (`openrouter` or `groq`) |
+| `EMBEDDING_MODEL` | `nvidia/llama-nemotron-embed-vl-1b-v2:free` | OpenRouter model for schema embedding |
+| `EMBEDDING_DIM` | `2048` | Vector dimension for the embedding model |
 
 ## Example requests
 
@@ -105,9 +108,9 @@ curl http://127.0.0.1:8000/v1/sessions/demo-thread
 
 The code lives in the `app/` package with four sub-packages:
 
-- **[app/main.py](app/main.py)** — FastAPI entry point. Lifespan opens/closes the Postgres checkpointer and SQL pool. Exception handlers: `RateLimitError` → 429 with `Retry-After`, `ValueError` → 400. Every response carries a server-generated `x-request-id`. Mounts routers from `api/chat.py`, `api/streaming.py`, `api/sessions.py`, `api/models.py`.
+- **[app/main.py](app/main.py)** — FastAPI entry point. Lifespan opens/closes the Postgres checkpointer and SQL pool. **On startup it calls `index_all_workspaces()`** which (re)creates the `schema_embeddings` pgvector table and embeds all workspace tables via OpenRouter. Exception handlers: `RateLimitError` → 429 with `Retry-After`, `ValueError` → 400. Every response carries a server-generated `x-request-id`. Mounts routers from `api/chat.py`, `api/streaming.py`, `api/sessions.py`, `api/models.py`.
 
-- **[app/models/factory.py](app/models/factory.py)** — Multi-provider LLM factory. `ProviderName` enum: `openrouter`, `zhipu`, `gemini`. `_PROVIDER_CONFIGS` maps each to its API key env var, base URL, and default model. `get_llm(provider, model, temperature)` returns a `ChatOpenAI` instance. `_DEFAULT_MODEL_OVERRIDES` is an in-memory dict — `set_default_model()` writes to it and `get_default_model()` reads from it; these resets on restart. Only providers with non-empty API keys appear in `get_available_providers()`.
+- **[app/models/factory.py](app/models/factory.py)** — Multi-provider LLM factory. `ProviderName` enum: `openrouter`, `zhipu`, `gemini`. `_PROVIDER_CONFIGS` maps each to its API key env var, base URL, and default model. `get_llm(provider, model, temperature)` returns a `ChatOpenAI` instance. `_DEFAULT_MODEL_OVERRIDES` is an in-memory dict — `set_default_model()` writes to it and `get_default_model()` reads from it; these reset on restart. Only providers with non-empty API keys appear in `get_available_providers()`. Also exposes `get_embedding_config()`, `get_embedding_model()`, and `get_embedding_dimension()` for the pgvector embedding pipeline.
 
 - **[app/models/persistence.py](app/models/persistence.py)** — `AsyncPostgresSaver` singleton for LangGraph checkpointing. `initialize()` connects and optionally runs `setup()`; `close()` tears it down. `get_database_url()` reads the three DB URL env vars in order.
 
@@ -117,7 +120,7 @@ The code lives in the `app/` package with four sub-packages:
 
 - **[app/graphs/chat.py](app/graphs/chat.py)** — Stateful LangGraph graph factory. `_compiled_chat_app(provider, model)` is `lru_cache(maxsize=None)` keyed by provider+model. The graph has a single `chatbot` node; Postgres checkpointing gives it multi-turn memory keyed by `thread_id`.
 
-- **[app/graphs/workflow.py](app/graphs/workflow.py)** — Stateless workflow graph. `_compiled_workflow_graph(provider, model)` is `lru_cache(maxsize=None)`. `classifier` routes to `analytics` or `general`; analytics runs `metric_resolver` → `sql_generator` → `query_tool` → `formatter`; general runs `chat_node`. `_WORKSPACE_TABLES` maps workspace names to DB tables — add a table name here to expose it to the SQL path. `run_workflow(query, workspace, provider, model)` is the public entry point.
+- **[app/graphs/workflow.py](app/graphs/workflow.py)** — Stateless workflow graph. `_compiled_workflow_graph(provider, model)` is `lru_cache(maxsize=None)`. `classifier` routes to `analytics` or `general`; analytics runs `metric_resolver` → `sql_generator` → `query_tool` → `formatter`; general runs `chat_node`. `_WORKSPACE_TABLES` maps workspace names to DB tables — add a table name here to expose it to the SQL path. `run_workflow(query, workspace, provider, model)` is the public entry point. **`metric_resolver` uses pgvector semantic search** — it embeds the user query and retrieves the top-3 most relevant tables from `schema_embeddings` using cosine similarity (`<=>`), replacing the prior approach of fetching all tables blindly.
 
 - **[app/service.py](app/service.py)** — `ChatService` with `ChatMode` routing. `ChatMode.SESSION` uses the stateful chat graph with Postgres-persisted session history. `ChatMode.STATELESS` uses the workflow graph with `general` workspace. `ChatMode.ANALYTICS` uses the workflow graph with `logistics-schema` workspace. `achat()` returns `ChatResult | WorkflowResult`; `astream()` yields `ChatStreamEvent | WorkflowStreamEvent`. Accepts an injected `ChatAppFactory` protocol for testing.
 
@@ -129,7 +132,11 @@ The code lives in the `app/` package with four sub-packages:
 
 - **[app/api/models.py](app/api/models.py)** — `GET /v1/model`, `GET /v1/models` (live OpenRouter API call via `httpx`), `GET /v1/providers`, `PATCH /v1/providers/{provider}/default-model`.
 
-- **[app/api/sql.py](app/api/sql.py)** — `AsyncConnectionPool` (`psycopg_pool`) for SQL. `is_safe_sql` validates read-only queries (first token must be `SELECT` or `WITH`, blocks destructive patterns). `execute_sql` and `fetch_table_schema` use the pool; `fetch_table_schema` caches results in `_WORKSPACE_SCHEMA_CACHE` (no TTL). Pool uses `dict_row` — all rows are `dict`s.
+- **[app/db/sql.py](app/db/sql.py)** — `AsyncConnectionPool` (`psycopg_pool`) for SQL. `is_safe_sql` validates read-only queries (first token must be `SELECT` or `WITH`, blocks destructive patterns). `execute_sql` and `fetch_table_schema` use the pool; `fetch_table_schema` caches results in `_WORKSPACE_SCHEMA_CACHE` (no TTL). Pool uses `dict_row` — all rows are `dict`s.
+
+- **[app/db/embeddings.py](app/db/embeddings.py)** — OpenRouter embedding client backed by pgvector. `_get_embedding()` calls the OpenRouter `/embeddings` endpoint. `ensure_schema_table()` creates the `schema_embeddings` pgvector table on startup. `upsert_table_embedding()` generates a vector from table metadata (name, columns, description) and stores it. `query_similar_tables()` embeds a user query and retrieves the top-K most similar table records using cosine similarity (`<=>`). All embedding config comes from `app/models/factory.py` — no hardcoded values.
+
+- **[app/db/indexer.py](app/db/indexer.py)** — Startup indexer that populates `schema_embeddings` from workspace metadata. `_WORKSPACE_TABLE_META` maps each workspace to its table definitions (name, columns, description). `index_workspace()` clears old embeddings and re-indexes all tables for a workspace. `index_all_workspaces()` is called once in `app/main.py` lifespan on every server boot.
 
 ## API documentation
 

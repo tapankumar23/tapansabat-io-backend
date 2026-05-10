@@ -53,7 +53,11 @@ sequenceDiagram
     SVC->>LLM: classify intent
     LLM-->>SVC: "analytics" | "general"
     alt analytics
-        SVC->>DB: fetch_table_schema
+        SVC->>OR: embed user query
+        OR-->>SVC: query embedding vector
+        SVC->>DB: query_similar_tables (pgvector, top-3)
+        DB-->>SVC: top-3 table names
+        SVC->>DB: fetch_table_schema (only those tables)
         DB-->>SVC: schema DDL
         SVC->>LLM: generate SQL
         LLM-->>SVC: SQL query
